@@ -56,7 +56,9 @@ export function buildMarkdown(meeting) {
     `- 日期：${meeting.date}`,
     `- 参会人：${meeting.attendees.length > 0 ? meeting.attendees.join('、') : '（未填写）'}`,
     `- 来源：${meeting.sourceType === 'recording' ? '录音转写' : meeting.sourceType === 'import' ? '导入记录' : '文本导入'}`,
+    meeting.audioPath === '' ? '' : `- 录音来源：${audioSourceLabel(meeting)}`,
     meeting.transcriptSeconds > 0 ? `- 录音时长：${formatDuration(meeting.transcriptSeconds)}` : '',
+    meeting.transcriptEdits > 0 ? `- 转写：经人工修订（${meeting.transcriptEdits} 次）` : '',
     `- 导出时间：${formatMoment(new Date())}`,
     '',
   ].filter((line) => line !== '')
@@ -183,7 +185,9 @@ export function buildHtml(meeting) {
     ['日期', meeting.date],
     ['参会人', meeting.attendees.length > 0 ? meeting.attendees.join('、') : '未填写'],
     ['来源', meeting.sourceType === 'recording' ? '录音转写' : meeting.sourceType === 'import' ? '导入记录' : '文本导入'],
+    meeting.audioPath === '' ? null : ['录音来源', audioSourceLabel(meeting)],
     meeting.transcriptSeconds > 0 ? ['录音时长', formatDuration(meeting.transcriptSeconds)] : null,
+    meeting.transcriptEdits > 0 ? ['转写', `经人工修订（${meeting.transcriptEdits} 次）`] : null,
     ['待办', progress.total === 0 ? '无' : `${progress.pushed}/${progress.total} 已写入日历`],
   ].filter((entry) => entry !== null)
 
@@ -266,9 +270,38 @@ export function buildHtml(meeting) {
   return parts.join('\n')
 }
 
+/** Harness home (`$DSH_HOME`), the base of every local plugin path. */
+export function resolveDshHome() {
+  return process.env.DSH_HOME ?? join(homedir(), '.dsh')
+}
+
+/**
+ * Plugin data directory: `$DSH_HOME/meeting-minutes/`.
+ * Both `exports/` and `audio/` derive from it, so they never diverge.
+ */
+export function resolveMeetingDataDir(home = resolveDshHome()) {
+  return join(home, 'meeting-minutes')
+}
+
 /** Resolve the export directory under the harness home. */
-export function resolveExportDir(home = process.env.DSH_HOME ?? join(homedir(), '.dsh')) {
-  return join(home, 'meeting-minutes', 'exports')
+export function resolveExportDir(home = resolveDshHome()) {
+  return join(resolveMeetingDataDir(home), 'exports')
+}
+
+/**
+ * One-line audio provenance label, shared by exports and tool output.
+ * Empty when the meeting has no retained recording (text imports, legacy rows).
+ */
+export function audioSourceLabel(meeting) {
+  if (meeting === null || meeting === undefined) return ''
+  if (typeof meeting.audioPath !== 'string' || meeting.audioPath === '') return ''
+  const name = typeof meeting.audioOriginalName === 'string' && meeting.audioOriginalName !== ''
+    ? meeting.audioOriginalName
+    : meeting.audioPath
+  const parts = [name]
+  if (typeof meeting.audioSha256 === 'string' && meeting.audioSha256 !== '') parts.push(`sha256 ${meeting.audioSha256.slice(0, 12)}`)
+  if (typeof meeting.audioPrunedAt === 'string' && meeting.audioPrunedAt !== '') parts.push('副本已清理（hash 保留）')
+  return parts.join(' · ')
 }
 
 /**

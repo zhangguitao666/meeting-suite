@@ -1,6 +1,6 @@
 {
   "name": "dsh-plugin-meeting-minutes",
-  "version": "1.1.0",
+  "version": "1.4.2",
   "private": false,
   "description": "会议纪要：录音转文字、腾讯会议纪要导入、AI 总结、可视化纪要与待办写入任务日历",
   "type": "module",
@@ -26,12 +26,19 @@
       ]
     }
   },
+  "scripts": {
+    "prepare:speaker-model": "node scripts/prepare-speaker-model.mjs"
+  },
+  "dependencies": {
+    "sherpa-onnx-node": "1.13.8"
+  },
   "files": [
     "lib/**/*.js",
     "cordis.patch.yml",
     "locale/*.json",
     "icon.svg",
-    "README.md"
+    "README.md",
+    "scripts/prepare-speaker-model.mjs"
   ],
   "license": "MIT",
   "repository": {

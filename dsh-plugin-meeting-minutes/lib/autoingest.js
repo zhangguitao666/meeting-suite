@@ -28,6 +28,7 @@ import { basename, extname, join } from 'node:path'
 import { promisify } from 'node:util'
 
 import { formatMoment, localDay } from './model.js'
+import { pruneAudio, storeAudio } from './audio-store.js'
 
 const execFileAsync = promisify(execFile)
 
@@ -275,7 +276,7 @@ export function createAutoIngest(options) {
   }
 
   /** Create one meeting from transcribed/imported text. */
-  async function storeIngested({ key, title, date, transcript, seconds, notes, sourceType }) {
+  async function storeIngested({ key, title, date, transcript, seconds, notes, sourceType, audio = null }) {
     const meeting = await store.add({
       title,
       date,
@@ -285,6 +286,11 @@ export function createAutoIngest(options) {
       notes,
       sourceType,
       autoImported: true,
+      audioPath: audio === null ? '' : audio.relPath,
+      audioSha256: audio === null ? '' : audio.sha256,
+      audioBytes: audio === null ? 0 : audio.bytes,
+      audioSeconds: seconds,
+      audioOriginalName: audio === null ? '' : audio.fileName,
     })
     await store.markAutoIngested(key, { meetingId: meeting.id, title: meeting.title, path: notes })
     logger?.info?.(`meeting-minutes: auto-ingested ${key} as ${meeting.id}`)
@@ -303,9 +309,32 @@ export function createAutoIngest(options) {
       if (isFresh) return null
 
       if (kind === 'audio') {
+        // Retain the copy (and its sha256) before ASR: the same recording is
+        // recognised even when it arrives again from another folder.
+        const bytes = await readFile(path)
+        let audio = null
+        try {
+          audio = await storeAudio({
+            bytes,
+            sourceName: path,
+            title: title || titleFromFile(path),
+            date: date || localDay(new Date(info.mtimeMs)),
+          })
+        } catch (error) {
+          logger?.warn?.(`meeting-minutes: 音频副本保存失败（${path}）：${error instanceof Error ? error.message : String(error)}`)
+        }
+        if (audio !== null) {
+          const existing = store.findByAudioSha256(audio.sha256)
+          if (existing !== null) {
+            // Same bytes already in the library: skip silently, remember the source.
+            await store.markAutoIngested(key, { meetingId: existing.id, title: existing.title, path }, { count: false })
+            logger?.info?.(`meeting-minutes: 同一录音已在 ${existing.id}，跳过 ${path}`)
+            return null
+          }
+        }
         const result = await asr.transcribeFile(path, { language: 'zh' })
         if (result.text.trim() === '') throw new Error('音频没有识别出文字')
-        const notes = `${notePrefix}\n文件：${path}`
+        const notes = `${notePrefix}\n文件：${path}${audio === null ? '' : `\n音频副本：${audio.relPath}`}`
         return await storeIngested({
           key,
           title: title || titleFromFile(path),
@@ -314,6 +343,7 @@ export function createAutoIngest(options) {
           seconds: result.audioSeconds,
           notes,
           sourceType: 'recording',
+          audio,
         })
       }
 
@@ -439,6 +469,15 @@ export function createAutoIngest(options) {
       let budget = await scanTencent(config, MAX_FILES_PER_SCAN)
       budget = await scanDirs(store.autoIngest, budget)
       await store.noteAutoScan({ lastScanAt: new Date().toISOString(), lastError: null })
+      // Retention rides on the existing poll instead of a second timer.
+      try {
+        const pruned = await pruneAudio({ store, logger })
+        if (pruned.removed.length > 0) {
+          logger?.info?.(`meeting-minutes: 清理音频副本 ${pruned.removed.length} 个（释放 ${Math.round(pruned.freedBytes / 1024 / 1024)}MB）`)
+        }
+      } catch (error) {
+        logger?.warn?.(`meeting-minutes: 音频副本清理失败：${error instanceof Error ? error.message : String(error)}`)
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
       await store.noteAutoScan({ lastScanAt: new Date().toISOString(), lastError: message })

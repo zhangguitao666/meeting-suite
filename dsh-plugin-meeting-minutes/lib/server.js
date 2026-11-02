@@ -10,12 +10,36 @@
  * @module dsh-plugin-meeting-minutes/server
  */
 
+import { readFile } from 'node:fs/promises'
+
 import { formatMoment, isGenericTitle, localDay, projectMeeting, todoProgress } from './model.js'
-import { sortMeetings } from './store.js'
+import { defaultSpeakerLabel, sortMeetings } from './store.js'
 import { exportMeeting } from './export.js'
+import { resolveStoredAudio, clearAudioParts, finalizeAudioParts, storeAudio, storeAudioPart } from './audio-store.js'
+import {
+  clearLiveSession,
+  clearStopRequest,
+  listLiveSessions,
+  listStopRequests,
+  requestStop,
+  touchLiveSession,
+} from './live-sessions.js'
 
 /** Registered prefix; the client builds its URLs from the same constant. */
 export const ROUTE_PREFIX = '/dsh-meeting'
+
+/** Fields an HTTP write may set (the store normalizes every one of them). */
+const WRITABLE_FIELDS = [
+  'title', 'date', 'attendees', 'transcript', 'notes', 'sourceType', 'transcriptSeconds',
+  'audioPath', 'audioSha256', 'audioBytes', 'audioSeconds', 'audioOriginalName',
+  'audioPrunedAt', 'audioPinned', 'audioError', 'exportedAt',
+  'transcriptRaw', 'transcriptEditedAt', 'transcriptEdits',
+]
+
+/** Audio provenance fields that may be written when a meeting is created. */
+const AUDIO_FIELDS = [
+  'audioPath', 'audioSha256', 'audioBytes', 'audioSeconds', 'audioOriginalName', 'audioPinned',
+]
 
 /** JSON response helper. */
 function sendJson(res, status, payload) {
@@ -68,7 +92,7 @@ function isLoopback(req) {
 
 /** Build the `/state` payload the panel renders. */
 export async function buildState(deps) {
-  const { store, asr, summarizer, calendar, autoIngest } = deps
+  const { store, asr, summarizer, calendar, autoIngest, speakerTagger } = deps
   await store.load()
   const [speech, calendarStatus] = await Promise.all([
     Promise.resolve().then(() => asr.status()),
@@ -89,6 +113,9 @@ export async function buildState(deps) {
     today: localDay(),
     clock: formatMoment(),
     autoIngest: auto,
+    speakers: typeof speakerTagger?.status === 'function' ? speakerTagger.status() : null,
+    activeRecording: listLiveSessions(),
+    stopRequested: listStopRequests(),
     config: {
       llm: summarizer.describeRoute(),
       asr: {
@@ -114,6 +141,51 @@ function requireMeeting(store, id) {
     throw error
   }
   return meeting
+}
+
+
+/**
+ * Tag one live slice with the speaker it most likely belongs to.
+ *
+ * The label is prefixed as `说话人2：文本` (full-width colon, no space). A label
+ * the user already renamed wins over the registry's default, and a newly seen
+ * speaker is durably added to `meeting.speakers` so the panel can list it.
+ * Any failure here degrades to plain text — transcription must never fail
+ * because voiceprint identification did.
+ *
+ * @returns `{ text, speaker }`, `speaker` is null when no tag was applied.
+ */
+async function tagLiveText(deps, meetingId, bytes, text) {
+  const { store, speakerTagger, logger } = deps
+  if (typeof text !== 'string' || text.trim() === '') return { text, speaker: null }
+  if (speakerTagger === undefined || speakerTagger === null || typeof speakerTagger.identify !== 'function') {
+    return { text, speaker: null }
+  }
+  let tagged = null
+  try {
+    tagged = await speakerTagger.identify(bytes, { meetingId })
+  } catch (error) {
+    logger?.warn?.(`meeting-minutes: 说话人识别失败（${meetingId}）：${String(error?.message ?? error)}`)
+    return { text, speaker: null }
+  }
+  if (tagged === null || tagged === undefined || typeof tagged.id !== 'string' || tagged.id === '') {
+    return { text, speaker: null }
+  }
+  let label = typeof tagged.label === 'string' && tagged.label.trim() !== ''
+    ? tagged.label.trim().slice(0, 40)
+    : defaultSpeakerLabel(tagged.id)
+  const known = store.get(meetingId)?.speakers?.find((entry) => entry.id === tagged.id) ?? null
+  if (known !== null) {
+    // Renaming a speaker mid-meeting must also relabel the following slices.
+    label = known.label
+  } else {
+    try {
+      await store.addSpeaker(meetingId, { id: tagged.id, label })
+    } catch (error) {
+      logger?.warn?.(`meeting-minutes: 记录说话人失败（${meetingId}/${tagged.id}）：${String(error?.message ?? error)}`)
+    }
+  }
+  return { text: `${label}：${text}`, speaker: { id: tagged.id, label } }
 }
 
 /**
@@ -193,6 +265,7 @@ export function registerRoutes(ctx, deps) {
           sourceType: body.sourceType,
           transcript: body.transcript,
           notes: body.notes,
+          ...Object.fromEntries(AUDIO_FIELDS.filter((key) => body[key] !== undefined).map((key) => [key, body[key]])),
         })
         sendJson(res, 200, { ok: true, meeting })
         return
@@ -205,21 +278,55 @@ export function registerRoutes(ctx, deps) {
 
       const id = segments[1]
 
+
+      if (segments.length === 3 && segments[2] === 'speakers' && method === 'GET') {
+        const meeting = requireMeeting(store, id)
+        sendJson(res, 200, { ok: true, speakers: meeting.speakers })
+        return
+      }
+
+      if (segments.length === 5 && segments[2] === 'speakers' && segments[4] === 'rename' && method === 'POST') {
+        const meeting = requireMeeting(store, id)
+        const speakerId = segments[3]
+        if (!meeting.speakers.some((entry) => entry.id === speakerId)) {
+          const error = new Error(`未找到说话人：${speakerId}`)
+          error.status = 404
+          throw error
+        }
+        const body = await readJsonBody(req)
+        const name = typeof body.name === 'string' ? body.name.trim() : ''
+        if (name === '') throw new Error('name 不能为空')
+        const updated = await store.renameSpeaker(id, speakerId, name)
+        // Keep the in-memory registry label in sync so later slices use it too.
+        try {
+          if (typeof (deps.speakerTagger)?.rename === 'function') deps.speakerTagger.rename(id, speakerId, name)
+        } catch (error) {
+          logger?.warn?.(`meeting-minutes: 同步说话人改名失败（${id}/${speakerId}）：${String(error?.message ?? error)}`)
+        }
+        sendJson(res, 200, { ok: true, meeting: updated })
+        return
+      }
+
       if (segments.length === 2) {
         if (method === 'GET') {
           sendJson(res, 200, { ok: true, meeting: requireMeeting(store, id) })
           return
         }
         if (method === 'PATCH' || method === 'POST') {
-          requireMeeting(store, id)
+          const current = requireMeeting(store, id)
           const body = await readJsonBody(req)
           const patch = {}
-          for (const key of ['title', 'date', 'attendees', 'transcript', 'notes', 'sourceType', 'transcriptSeconds']) {
+          for (const key of WRITABLE_FIELDS) {
             if (body[key] !== undefined) patch[key] = body[key]
           }
           if (body.appendTranscript === true) {
-            const current = requireMeeting(store, id)
             patch.transcript = current.transcript === '' ? String(body.transcript ?? '') : `${current.transcript}\n${String(body.transcript ?? '')}`
+          } else if (body.transcript !== undefined && String(body.transcript) !== current.transcript) {
+            // A manual transcript edit: keep the untouched ASR text and record
+            // that the meeting was hand-corrected (exports note it).
+            patch.transcriptEdits = Number(current.transcriptEdits) + 1
+            patch.transcriptEditedAt = new Date().toISOString()
+            if (current.transcriptRaw === '') patch.transcriptRaw = current.transcript
           }
           if (Object.keys(patch).length === 0) throw new Error('没有提供任何要修改的字段')
           const updated = await store.patch(id, patch)
@@ -228,6 +335,11 @@ export function registerRoutes(ctx, deps) {
         }
         if (method === 'DELETE') {
           const removed = await store.remove(id)
+          // A discarded live recording leaves temporary slices behind; drop them.
+          await clearAudioParts({ meetingId: id })
+          clearLiveSession(id)
+          clearStopRequest(id)
+          try { deps.speakerTagger?.reset?.(id) } catch { /* registry cleanup is best effort */ }
           sendJson(res, removed === null ? 404 : 200, removed === null ? { ok: false, error: '未找到会议' } : { ok: true })
           return
         }
@@ -261,20 +373,139 @@ export function registerRoutes(ctx, deps) {
       }
 
       if (segments.length === 3 && segments[2] === 'transcribe' && method === 'POST') {
-        requireMeeting(store, id)
+        const meeting = requireMeeting(store, id)
         const language = url.searchParams.get('language') ?? undefined
         const providerId = url.searchParams.get('provider') ?? undefined
-        const bytes = await readRawBody(req)
-        if (bytes.length === 0) throw new Error('音频为空：没有收到可识别的数据。')
-        const result = await asr.transcribeWav(bytes, { language, providerId })
-        const updated = await store.appendTranscript(id, result.text, result.audioSeconds)
+        // `?fromStored=1` re-transcribes the retained copy, so a failed ASR run
+        // does not need the audio to be uploaded again.
+        const fromStored = url.searchParams.get('fromStored') === '1'
+        // Live recording streams ~5 s slices; only those are speaker-tagged.
+        const live = url.searchParams.get('live') === '1'
+        let bytes
+        if (fromStored) {
+          const stored = resolveStoredAudio(meeting.audioPath)
+          if (stored === '') throw new Error('这场会议没有已保留的音频副本，无法从副本重转')
+          try {
+            bytes = new Uint8Array(await readFile(stored))
+          } catch (error) {
+            if (error?.code === 'ENOENT') throw new Error(`音频副本已被清理或不存在：${stored}`)
+            throw error
+          }
+        } else {
+          bytes = await readRawBody(req)
+          if (bytes.length === 0) throw new Error('音频为空：没有收到可识别的数据。')
+        }
+        let audio = null
+        if (!fromStored) {
+          // Live recording streams ~5 s slices only for recognition: keep the
+          // slice in the temporary session folder, never as a retained copy.
+          // The whole meeting is merged once by `/audio/finalize` on stop.
+          try {
+            if (live) {
+              await storeAudioPart({
+                meetingId: id,
+                index: url.searchParams.get('index'),
+                bytes,
+              })
+              touchLiveSession({ meetingId: id, title: meeting.title, date: meeting.date })
+            } else {
+              audio = await storeAudio({
+                bytes,
+                sourceName: url.searchParams.get('name') ?? '',
+                date: meeting.date,
+                title: meeting.title,
+              })
+              await store.patch(id, {
+                audioPath: audio.relPath,
+                audioSha256: audio.sha256,
+                audioBytes: audio.bytes,
+                audioOriginalName: audio.fileName,
+                audioError: '',
+              })
+            }
+          } catch (error) {
+            logger?.warn?.(`meeting-minutes: 音频副本保存失败（${id}）：${String(error?.message ?? error)}`)
+          }
+        }
+        const fingerprint = audio === null ? meeting.audioSha256 : audio.sha256
+        const holder = fingerprint === '' ? null : store.findByAudioSha256(fingerprint)
+        const duplicate = holder === null || holder.id === id ? null : { id: holder.id, title: holder.title }
+        try {
+          const result = await asr.transcribeWav(bytes, { language, providerId })
+          // Voiceprint tagging only makes sense on live slices: imported audio
+          // and `fromStored` re-runs are whole files without turn boundaries.
+          const tagged = live && !fromStored
+            ? await tagLiveText(deps, id, bytes, result.text)
+            : { text: result.text, speaker: null }
+          const updated = await store.appendTranscript(id, tagged.text, result.audioSeconds)
+          await store.patch(id, { audioSeconds: result.audioSeconds, audioError: '' })
+          sendJson(res, 200, {
+            ok: true,
+            text: tagged.text,
+            speaker: tagged.speaker,
+            audioSeconds: result.audioSeconds,
+            inferenceSeconds: result.inferenceSeconds,
+            transcript: updated?.transcript ?? '',
+            transcriptSeconds: updated?.transcriptSeconds ?? 0,
+            audio: audio === null
+              ? (meeting.audioPath === '' ? null : { path: meeting.audioPath, sha256: meeting.audioSha256 })
+              : { path: audio.relPath, sha256: audio.sha256, bytes: audio.bytes },
+            duplicate,
+          })
+          return
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error)
+          await store.patch(id, { audioError: message })
+          sendJson(res, 400, {
+            ok: false,
+            error: audio === null ? message : `${message}（音频副本已保留：${audio.relPath}）`,
+            audioPath: audio === null ? meeting.audioPath : audio.relPath,
+            audioError: message,
+          })
+          return
+        }
+      }
+
+      if (segments.length === 4 && segments[2] === 'audio' && segments[3] === 'stop' && method === 'POST') {
+        requireMeeting(store, id)
+        requestStop(id)
+        sendJson(res, 200, { ok: true, meetingId: id, stopRequested: true })
+        return
+      }
+
+      if (segments.length === 4 && segments[2] === 'audio' && segments[3] === 'finalize' && method === 'POST') {
+        const meeting = requireMeeting(store, id)
+        let merged
+        try {
+          merged = await finalizeAudioParts({ meetingId: id, title: meeting.title, date: meeting.date })
+          clearLiveSession(id)
+          clearStopRequest(id)
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error)
+          sendJson(res, 400, { ok: false, error: message })
+          return
+        }
+        const holder = store.findByAudioSha256(merged.sha256)
+        const duplicate = holder === null || holder.id === id ? null : { id: holder.id, title: holder.title }
+        const updated = await store.patch(id, {
+          audioPath: merged.relPath,
+          audioSha256: merged.sha256,
+          audioBytes: merged.bytes,
+          audioSeconds: merged.seconds,
+          audioOriginalName: merged.fileName,
+          audioError: '',
+        })
         sendJson(res, 200, {
           ok: true,
-          text: result.text,
-          audioSeconds: result.audioSeconds,
-          inferenceSeconds: result.inferenceSeconds,
-          transcript: updated?.transcript ?? '',
-          transcriptSeconds: updated?.transcriptSeconds ?? 0,
+          meeting: updated,
+          audio: {
+            path: merged.relPath,
+            sha256: merged.sha256,
+            bytes: merged.bytes,
+            seconds: merged.seconds,
+            parts: merged.parts,
+          },
+          duplicate,
         })
         return
       }
@@ -329,6 +560,9 @@ export function registerRoutes(ctx, deps) {
         const meeting = requireMeeting(store, id)
         const format = url.searchParams.get('format') === 'md' ? 'md' : 'html'
         const exported = await exportMeeting(meeting, format)
+        // Retention prefers deleting copies that already produced an exported
+        // report, so the export timestamp is part of the record.
+        await store.patch(id, { exportedAt: new Date().toISOString() })
         sendJson(res, 200, { ok: true, ...exported })
         return
       }

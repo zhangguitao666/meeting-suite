@@ -329,3 +329,102 @@ test('工具函数 id 前缀与本地时间格式', () => {
   assert.match(formatMoment(new Date(2026, 0, 2, 3, 4)), /^2026-01-02 03:04$/)
   assert.equal(localDay(new Date(2026, 0, 2)), '2026-01-02')
 })
+
+test('老记录没有音频溯源字段也能读，新字段可往返', () => {
+  // A store written by 1.1.0 has none of the audio fields.
+  const legacy = normalizeMeeting({ id: 'mt_legacy', title: '老会议', date: '2026-10-20', sourceType: 'recording' }, { now: NOW })
+  assert.equal(legacy.audioPath, '')
+  assert.equal(legacy.audioSha256, '')
+  assert.equal(legacy.audioBytes, 0)
+  assert.equal(legacy.audioSeconds, 0)
+  assert.equal(legacy.audioOriginalName, '')
+  assert.equal(legacy.audioPrunedAt, '')
+  assert.equal(legacy.audioPinned, false)
+  assert.equal(legacy.audioError, '')
+  assert.equal(legacy.exportedAt, '')
+  assert.equal(projectMeeting(legacy).hasAudio, false)
+
+  const sha = 'a'.repeat(64)
+  const withAudio = normalizeMeeting({
+    title: '有录音的会',
+    date: '2026-10-21',
+    audioPath: 'meeting-minutes/audio/2026-10-21-有录音的会-aaaaaaaa.m4a',
+    audioSha256: sha.toUpperCase(),
+    audioBytes: 12,
+    audioSeconds: 3.56,
+    audioOriginalName: '有录音的会.m4a',
+    audioPinned: true,
+    exportedAt: '2026-10-21T02:00:00.000Z',
+  }, { now: NOW })
+  assert.equal(withAudio.audioSha256, sha)
+  assert.equal(withAudio.audioSeconds, 3.6)
+  assert.equal(withAudio.audioPinned, true)
+  assert.equal(projectMeeting(withAudio).hasAudio, true)
+
+  // A patch keeps provenance unless it explicitly replaces it.
+  const patched = normalizeMeeting({ title: '有录音的会（改）' }, { now: NOW, base: withAudio })
+  assert.equal(patched.audioPath, withAudio.audioPath)
+  assert.equal(patched.audioSha256, sha)
+  assert.equal(patched.audioPinned, true)
+
+  // Malformed digests and negative numbers degrade instead of throwing.
+  const broken = normalizeMeeting({ title: '坏 hash', audioSha256: 'not-a-hash', audioBytes: -5, audioSeconds: -1 }, { now: NOW })
+  assert.equal(broken.audioSha256, '')
+  assert.equal(broken.audioBytes, 0)
+  assert.equal(broken.audioSeconds, 0)
+})
+
+test('导出里带「录音来源」行，无音频的老记录不出现该行', () => {
+  const sha = 'b'.repeat(64)
+  const withAudio = normalizeMeeting({
+    title: '带录音的会',
+    date: '2026-10-21',
+    transcript: '内容',
+    transcriptSeconds: 61,
+    audioPath: 'meeting-minutes/audio/2026-10-21-带录音的会-bbbbbbbb.m4a',
+    audioSha256: sha,
+    audioOriginalName: '带录音的会.m4a',
+    summary: sampleSummary(),
+  }, { now: NOW })
+  const md = buildMarkdown(withAudio)
+  assert.ok(md.includes('- 录音来源：带录音的会.m4a · sha256 bbbbbbbbbbbb'))
+  assert.ok(md.includes('- 录音时长：1 分 1 秒'))
+  const html = buildHtml(withAudio)
+  assert.ok(html.includes('录音来源'))
+  assert.ok(html.includes('sha256 bbbbbbbbbbbb'))
+
+  const legacy = normalizeMeeting({ title: '老会议', date: '2026-10-20', transcript: '内容', summary: sampleSummary() }, { now: NOW })
+  assert.ok(!buildMarkdown(legacy).includes('录音来源'))
+  assert.ok(!buildHtml(legacy).includes('录音来源'))
+
+  const pruned = normalizeMeeting({
+    title: '副本已清理',
+    date: '2026-10-21',
+    audioPath: 'meeting-minutes/audio/x.m4a',
+    audioSha256: sha,
+    audioPrunedAt: '2026-10-22T00:00:00.000Z',
+  }, { now: NOW })
+  assert.ok(buildMarkdown(pruned).includes('副本已清理（hash 保留）'))
+})
+
+test('转写修订：原文保留、修订次数与时间可往返，导出标注修订', () => {
+  const created = normalizeMeeting({ title: '修订会', transcript: '原始识别文本' }, { now: NOW })
+  assert.equal(created.transcriptRaw, '原始识别文本')
+  assert.equal(created.transcriptEdits, 0)
+  assert.equal(created.transcriptEditedAt, '')
+  assert.ok(!buildMarkdown(created).includes('经人工修订'))
+  assert.ok(!buildHtml(created).includes('经人工修订'))
+
+  const edited = normalizeMeeting({
+    transcript: '手工改过的文本',
+    transcriptEditedAt: '2026-10-21T02:00:00.000Z',
+    transcriptEdits: 1,
+  }, { now: NOW, base: created })
+  assert.equal(edited.transcript, '手工改过的文本')
+  assert.equal(edited.transcriptRaw, '原始识别文本')
+  assert.equal(edited.transcriptEdits, 1)
+  assert.equal(edited.transcriptEditedAt, '2026-10-21T02:00:00.000Z')
+  assert.equal(projectMeeting(edited).transcriptEdits, 1)
+  assert.ok(buildMarkdown(edited).includes('- 转写：经人工修订（1 次）'))
+  assert.ok(buildHtml(edited).includes('经人工修订（1 次）'))
+})

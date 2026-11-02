@@ -109,6 +109,12 @@ function clampNumber(value, fallback, min, max) {
   return Math.min(max, Math.max(min, number))
 }
 
+/** Keep only a valid sha256 hex digest (64 lowercase hex chars), else `''`. */
+function normalizeSha256(value) {
+  const text = asText(value).toLowerCase()
+  return /^[a-f0-9]{64}$/.test(text) ? text : ''
+}
+
 /** Normalize a tag-like string list. */
 function textList(value, max, maxLength = 400) {
   if (!Array.isArray(value)) return []
@@ -307,6 +313,32 @@ export function normalizeMeeting(raw, options = {}) {
       : clampNumber(input.transcriptSeconds, 0, 0, 24 * 3600)
   ) * 10) / 10
   const notes = input.notes === undefined ? asText(base.notes) : capText(input.notes, 4000)
+  // Audio provenance: the retained copy is fingerprinted **before** transcription,
+  // so a record still points at its source recording when ASR fails.
+  const audioPath = capText(input.audioPath === undefined ? base.audioPath : input.audioPath, 600)
+  const audioSha256 = normalizeSha256(input.audioSha256 === undefined ? base.audioSha256 : input.audioSha256)
+  const audioBytes = Math.trunc(clampNumber(
+    input.audioBytes === undefined ? base.audioBytes : input.audioBytes, 0, 0, 1024 ** 4,
+  ))
+  const audioSeconds = Math.round(clampNumber(
+    input.audioSeconds === undefined ? base.audioSeconds : input.audioSeconds, 0, 0, 24 * 3600,
+  ) * 10) / 10
+  const audioOriginalName = capText(input.audioOriginalName === undefined ? base.audioOriginalName : input.audioOriginalName, 300)
+  const audioPrunedAt = asText(input.audioPrunedAt === undefined ? base.audioPrunedAt : input.audioPrunedAt)
+  const audioPinned = input.audioPinned === true || (input.audioPinned === undefined && base.audioPinned === true)
+  const audioError = capText(input.audioError === undefined ? base.audioError : input.audioError, 400)
+  const exportedAt = asText(input.exportedAt === undefined ? base.exportedAt : input.exportedAt)
+  // Transcript revision: `transcriptRaw` keeps the untouched ASR output so a
+  // hand-corrected `transcript` never loses the original wording; exports and
+  // re-summaries use `transcript`, the audio sha256 is unaffected either way.
+  const transcriptRawInput = input.transcriptRaw === undefined ? base.transcriptRaw : input.transcriptRaw
+  const transcriptRaw = typeof transcriptRawInput === 'string' && transcriptRawInput !== ''
+    ? transcriptRawInput
+    : transcript
+  const transcriptEditedAt = asText(input.transcriptEditedAt === undefined ? base.transcriptEditedAt : input.transcriptEditedAt)
+  const transcriptEdits = Math.trunc(clampNumber(
+    input.transcriptEdits === undefined ? base.transcriptEdits : input.transcriptEdits, 0, 0, 100000,
+  ))
   const autoImported = input.autoImported === true || (input.autoImported === undefined && base.autoImported === true)
   const summaryInput = input.summary === undefined ? base.summary ?? null : input.summary
   const summary = summaryInput === null
@@ -325,6 +357,18 @@ export function normalizeMeeting(raw, options = {}) {
     sourceType,
     transcript,
     transcriptSeconds,
+    audioPath,
+    audioSha256,
+    audioBytes,
+    audioSeconds,
+    audioOriginalName,
+    audioPrunedAt,
+    audioPinned,
+    audioError,
+    exportedAt,
+    transcriptRaw,
+    transcriptEditedAt,
+    transcriptEdits,
     notes,
     autoImported,
     summary,
@@ -348,6 +392,9 @@ export function projectMeeting(meeting) {
     pendingTodoCount: todos.filter((todo) => todo.calendarTaskId === null).length,
     transcriptChars: meeting.transcript.length,
     transcriptSeconds: meeting.transcriptSeconds,
+    transcriptEdits: meeting.transcriptEdits,
+    hasAudio: meeting.audioPath !== '',
+    exportedAt: meeting.exportedAt,
     autoImported: meeting.autoImported === true,
     updatedAt: meeting.updatedAt,
   }

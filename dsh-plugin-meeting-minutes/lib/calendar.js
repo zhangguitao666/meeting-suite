@@ -13,19 +13,30 @@
 /** Route prefix owned by the task-calendar plugin. */
 export const CALENDAR_ROUTE = '/dsh-task-calendar'
 
-/** Resolve the loopback base URL of the Harness web server. */
+/**
+ * Resolve the loopback base URL of the Harness web server.
+ *
+ * The host service exposes the OS-assigned listening port as a `port` getter;
+ * `getOrigin()` only exists on some builds, so prefer the port and keep the
+ * origin as a secondary source. The hard-coded 50505 is a last resort for
+ * tests/older hosts and must never win over a real listening port — otherwise
+ * every calendar call fails with `fetch failed` on a random-port host.
+ */
 export function loopbackBase(ctx) {
+  const webServer = ctx?.webServer
+  const port = Number(webServer?.port)
+  if (Number.isFinite(port) && port > 0) return `http://127.0.0.1:${port}`
   let origin = ''
   try {
-    origin = ctx.webServer?.getOrigin?.() ?? ''
+    origin = webServer?.getOrigin?.() ?? ''
   } catch {
     origin = ''
   }
   if (origin === '') return 'http://127.0.0.1:50505'
   try {
     const url = new URL(origin)
-    const port = url.port === '' ? (url.protocol === 'https:' ? '443' : '80') : url.port
-    return `http://127.0.0.1:${port}`
+    const originPort = url.port === '' ? (url.protocol === 'https:' ? '443' : '80') : url.port
+    return `http://127.0.0.1:${originPort}`
   } catch {
     return 'http://127.0.0.1:50505'
   }

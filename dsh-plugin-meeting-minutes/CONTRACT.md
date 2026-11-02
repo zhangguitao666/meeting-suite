@@ -19,12 +19,17 @@ Meeting（完整）：
   "sourceType": "text | recording | import",
   "transcript": "……全文……",
   "transcriptSeconds": 183.2,
+  "speakers": [{ "id": "speaker-1", "label": "说话人1" }],
   "notes": "",
   "createdAt": "2026-10-21T09:00:00.000Z",
   "updatedAt": "2026-10-21T09:30:00.000Z",
   "summary": null
 }
 ```
+
+`speakers` 是本地说话人识别（CAM++，全本地推理）得到的说话人列表：`id` 稳定不变，`label` 可改名，
+默认 `说话人1`、`说话人2`……；未启用（`MEETING_SPEAKER_DISABLE=1`）或识别失败时为空数组 `[]`。
+带说话人标签时 `transcript` 每行格式为 **`说话人N：文本`**，未识别时保持纯文本。
 
 `summary`（LLM 生成，`todos` 由宿主补 id 与推送状态）：
 
@@ -72,7 +77,9 @@ Meeting（完整）：
 | PATCH | `/meetings/:id` | `{ title?, date?, attendees?, transcript?, appendTranscript?, notes? }` | `{ ok, meeting }` |
 | DELETE | `/meetings/:id` | — | `{ ok }` |
 | POST | `/meetings/:id/summarize` | `{ force?: boolean }` | `{ ok, meeting }`（生成/重生成纪要，可能较慢） |
-| POST | `/meetings/:id/transcribe?language=zh` | **原始音频 WAV 字节**（`audio/wav`，16kHz 单声道 PCM16） | `{ ok, text, audioSeconds, inferenceSeconds }` |
+| POST | `/meetings/:id/transcribe?language=zh&live=1&index=N` | **原始音频 WAV 字节**（`audio/wav`，16kHz 单声道 PCM16） | `{ ok, text, speaker: { id, label } \| null, audioSeconds, inferenceSeconds, transcript, transcriptSeconds, audio, duplicate }`（`live=1` 是实时录音切片：做本地说话人标注并暂存切片；否则整段转写、不做声纹标注） |
+| GET | `/meetings/:id/speakers` | — | `{ ok, speakers: [{ id, label }] }` |
+| POST | `/meetings/:id/speakers/:speakerId/rename` | `{ name }` | `{ ok, meeting }`（只改标签、不重新推理；`name` 为空或过长 → 400） |
 | GET | `/speech/status` | — | `{ ok, speech }` |
 | POST | `/speech/prepare` | `{ providerId? }` | `{ ok, speech }`（触发本地模型下载/加载） |
 | PATCH | `/meetings/:id/todos/:todoId` | `{ title?, owner?, due?, priority?, notes? }` | `{ ok, meeting }` |
@@ -104,6 +111,14 @@ Meeting（完整）：
 }
 ```
 
+## Agent 工具
+
+宿主同时把这套数据暴露成模型工具（与 HTTP 路由同源同存储）：
+
+| 工具 | 参数 | 作用 |
+| :-- | :-- | :-- |
+| `meeting_speakers` | `{ id \| match, action: 'list' \| 'rename', speakerId?, name? }` | `action: 'list'` 列出会议的 `speakers`；`action: 'rename'` 必须同时给 `speakerId` 与 `name`，只改标签、不重新推理。`id` 与 `match`（唯一标题关键词）二选一。 |
+
 ## 浏览器端约定
 
 - 录音：`navigator.mediaDevices.getUserMedia({ audio: true })` + `MediaRecorder`；停止后用
@@ -117,6 +132,10 @@ Meeting（完整）：
 - 腾讯会议纪要文本导入：粘贴框 + `.txt/.md/.json` 文件读取（`file.text()`），
   `POST /meetings`（`sourceType: "text"`），或对已打开会议 `PATCH transcript`。
 - 所有写操作成功后重新 `GET /state` 和 `GET /meetings/:id` 刷新界面。
+- 说话人：转写带标签时行首是 `说话人N：`；`GET /meetings/:id/speakers` 拿 `speakers: [{id, label}]`，
+  改名调 `POST /meetings/:id/speakers/:speakerId/rename { name }`，成功后重新 `GET /meetings/:id`。
+  实时转写的切段由本地 VAD 决定，停顿时长阈值存浏览器端
+  `localStorage['dsh.meeting.vad.silenceSeconds']`（支持 `1.5 / 3 / 5`，默认 `1.5`）。
 - 界面只用 `--dsw-alias-*` 主题 token；不要引用任何 Harness Client 包（除 React/jsx-runtime）。
 - 侧栏图标：`sidebar.panellist`，`id: 'meeting-minutes'`, `label: '会议纪要'`, glyph 为
   `<svg currentColor>`；主面板：`main` key `'meeting-minutes'`。

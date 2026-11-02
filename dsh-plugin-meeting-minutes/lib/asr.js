@@ -21,6 +21,7 @@ import { join } from 'node:path'
 import { promisify } from 'node:util'
 
 import { concatText, splitWav, toCanonicalWav, validateWav } from './audio.js'
+import { probeVoiceStudio, resolveVoiceStudioSettings, transcribeViaVoiceStudio } from './voicestudio.js'
 
 const execFileAsync = promisify(execFile)
 
@@ -168,6 +169,9 @@ export function createAsr({ ctx, config = {} } = {}) {
   const segmentSeconds = numberOr(config?.segmentSeconds, DEFAULT_SEGMENT_SECONDS, 1)
   const pollMs = numberOr(config?.pollMs, DEFAULT_POLL_MS, 100)
   const prepareTimeoutMs = numberOr(config?.prepareTimeoutMs, DEFAULT_PREPARE_TIMEOUT_MS, 1000)
+  // 外部 VoiceStudio 后端（默认 auto）：本机后端活着就用它，能拿到带说话人的
+  // segments；没开/转写失败就回退下面的宿主 SenseVoice 链路，见 lib/voicestudio.js。
+  const voiceStudio = resolveVoiceStudioSettings(process.env)
 
   /** 读取宿主服务；缺失或 ctx.get 抛错都当作没有服务。 */
   function service() {
@@ -434,7 +438,7 @@ export function createAsr({ ctx, config = {} } = {}) {
    *
    * @param path - 音频文件绝对路径（wav/mp3/m4a/mp4/aac 等）。
    * @param options - `{ language='zh', providerId?, signal? }`。
-   * @returns `{ text, audioSeconds, inferenceSeconds }`。
+   * @returns `{ text, audioSeconds, inferenceSeconds, backend, segments?, speakers? }`。
    */
   async function transcribeFile(path, options = {}) {
     const { language, providerId, signal } = options
@@ -442,6 +446,13 @@ export function createAsr({ ctx, config = {} } = {}) {
       throw new Error('音频文件路径不能为空')
     }
     const file = path.trim()
+
+    // 先问 VoiceStudio：它能直接吃 mp3/m4a 原文件，还能给带说话人的 segments。
+    // 不可用时按 MEETING_ASR_BACKEND 的语义回退（auto）或抛错（voicestudio）。
+    if (voiceStudio.enabled) {
+      const viaVoiceStudio = await tryVoiceStudio(file, language, signal)
+      if (viaVoiceStudio !== null) return viaVoiceStudio
+    }
 
     let bytes
     try {
@@ -492,8 +503,57 @@ export function createAsr({ ctx, config = {} } = {}) {
       }
     }
 
-    return transcribeWav(bytes, { language, providerId, signal })
+    const local = await transcribeWav(bytes, { language, providerId, signal })
+    return { ...local, backend: 'sensevoice-local' }
   }
 
-  return { status, prepare, transcribeWav, transcribeFile }
+  /**
+   * 用 VoiceStudio 试一次转写。
+   *
+   * - 后端没响应：`MEETING_ASR_BACKEND=auto` 静默回退（返回 null 交给 SenseVoice），
+   *   `voicestudio` 则抛错，让用户看到「没开 / 地址不对」的真实原因。
+   * - 转写失败：auto 同样回退并在日志留一行；voicestudio 直接把错误抛给用户。
+   *
+   * @param file - 音频文件路径（原文件，不做 WAV 转换）。
+   * @param language - 语言提示。
+   * @param signal - 取消信号。
+   */
+  async function tryVoiceStudio(file, language, signal) {
+    const available = await probeVoiceStudio(voiceStudio)
+    if (!available) {
+      if (!voiceStudio.fallback) {
+        throw new Error(
+          `VoiceStudio 不可用（${voiceStudio.baseUrl} 没有响应）。请确认 VoiceStudio.app 正在运行；`
+            + '或把 MEETING_ASR_BACKEND 设为 auto/local，改用宿主 SenseVoice。',
+        )
+      }
+      return null
+    }
+    try {
+      const result = await transcribeViaVoiceStudio(file, voiceStudio, { language, signal })
+      return { ...result, backend: 'voicestudio' }
+    } catch (error) {
+      if (error?.name === 'AbortError') throw error
+      const message = errorMessage(error)
+      if (!voiceStudio.fallback) throw new Error(`VoiceStudio 转写失败：${message}`)
+      // 回退是设计内的降级，不打断转写；日志里留一行方便排查。
+      try {
+        ctx.logger?.warn?.(`meeting-minutes: VoiceStudio 转写失败，回退宿主 SenseVoice（${message}）`)
+      } catch {
+        /* logger 不可用时忽略 */
+      }
+      return null
+    }
+  }
+
+  /** 当前转写后端的设置快照（工具输出 / 面板展示用）。 */
+  function backendInfo() {
+    return {
+      mode: voiceStudio.enabled ? (voiceStudio.fallback ? 'auto' : 'voicestudio') : 'local',
+      baseUrl: voiceStudio.baseUrl,
+      diarize: voiceStudio.diarize,
+    }
+  }
+
+  return { status, prepare, transcribeWav, transcribeFile, backendInfo }
 }

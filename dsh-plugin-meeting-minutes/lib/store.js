@@ -31,6 +31,44 @@ export function resolveStoreFile(home = dshHome()) {
   return join(home, 'storages', STORE_FILE)
 }
 
+/** `speaker-1` 的默认中文标签：`说话人1`。 */
+export function defaultSpeakerLabel(id) {
+  const match = /^speaker-(\d{1,4})$/u.exec(String(id ?? ''))
+  return match === null ? '说话人' : `说话人${Number(match[1])}`
+}
+
+/**
+ * Normalize the persisted speaker list: `[{ id: 'speaker-1', label: '说话人1' }]`.
+ *
+ * Speaker identity comes from the local voiceprint registry; the store only
+ * keeps the durable id → label mapping so a renamed speaker survives restarts.
+ * Malformed entries are dropped instead of failing the whole meeting load.
+ *
+ * @param value - raw speaker list.
+ * @returns canonical speaker list (at most 32 entries, unique ids).
+ */
+export function normalizeSpeakers(value) {
+  if (!Array.isArray(value)) return []
+  const speakers = []
+  const seen = new Set()
+  for (const entry of value) {
+    if (entry === null || typeof entry !== 'object') continue
+    const id = typeof entry.id === 'string' ? entry.id.trim() : ''
+    if (!/^speaker-\d{1,4}$/u.test(id) || seen.has(id)) continue
+    const label = typeof entry.label === 'string' ? entry.label.trim() : ''
+    seen.add(id)
+    speakers.push({ id, label: (label === '' ? defaultSpeakerLabel(id) : label).slice(0, 40) })
+    if (speakers.length >= 32) break
+  }
+  return speakers
+}
+
+/** 在纯文本里把 `旧标签：` 前缀全文替换成 `新标签：`。 */
+function replaceSpeakerPrefix(text, oldLabel, newLabel) {
+  if (typeof text !== 'string' || text === '' || oldLabel === newLabel) return text
+  return text.split(`${oldLabel}：`).join(`${newLabel}：`)
+}
+
 /** Read+parse the document; a corrupt file is renamed and treated as empty. */
 async function readDocument(file, logger) {
   let raw
@@ -43,7 +81,13 @@ async function readDocument(file, logger) {
   try {
     const parsed = JSON.parse(raw)
     const meetings = Array.isArray(parsed?.meetings)
-      ? parsed.meetings.map((meeting) => normalizeMeeting(meeting, { now: new Date(meeting?.createdAt ?? Date.now()) }))
+      ? parsed.meetings.map((entry) => {
+        const meeting = normalizeMeeting(entry, { now: new Date(entry?.createdAt ?? Date.now()) })
+        // `speakers` lives outside model.js (the panel/package lines own that
+        // file), so the store reapplies it when rehydrating from disk.
+        meeting.speakers = normalizeSpeakers(entry?.speakers)
+        return meeting
+      })
       : []
     return {
       version: 1,
@@ -127,7 +171,7 @@ export class MeetingStore {
   }
 
   /** Remember one ingested source file so it is never imported twice. */
-  async markAutoIngested(key, info) {
+  async markAutoIngested(key, info, options = {}) {
     await this.update((doc) => {
       const auto = doc.autoIngest
       auto.ingested[key] = {
@@ -136,7 +180,8 @@ export class MeetingStore {
         at: new Date().toISOString(),
         path: String(info.path ?? ''),
       }
-      auto.importedCount = Number(auto.importedCount) + 1
+      // A silent duplicate skip remembers the source without inflating the count.
+      if (options.count !== false) auto.importedCount = Number(auto.importedCount) + 1
       delete auto.failures[key]
       // Keep the bookkeeping bounded; the newest entries win.
       const keys = Object.keys(auto.ingested)
@@ -185,6 +230,13 @@ export class MeetingStore {
     return partial.length === 1 ? partial[0] : null
   }
 
+  /** Find the meeting that already holds this audio fingerprint, or null. */
+  findByAudioSha256(sha256) {
+    const needle = typeof sha256 === 'string' ? sha256.trim().toLowerCase() : ''
+    if (needle === '') return null
+    return this.#doc.meetings.find((meeting) => meeting.audioSha256 === needle) ?? null
+  }
+
   /** Persist the document through temp-file + rename. */
   async #persist() {
     const payload = JSON.stringify(this.#doc, null, 2)
@@ -218,6 +270,7 @@ export class MeetingStore {
   async add(raw, options = {}) {
     const now = options.now ?? new Date()
     const meeting = normalizeMeeting({ ...raw, id: raw?.id ?? undefined }, { now })
+    meeting.speakers = normalizeSpeakers(raw?.speakers)
     await this.update((doc) => { doc.meetings.push(meeting) })
     return meeting
   }
@@ -235,8 +288,79 @@ export class MeetingStore {
       if (index === -1) throw new Error(`未找到会议：${id}`)
       const base = doc.meetings[index]
       const next = normalizeMeeting({ ...patch, id }, { now, base })
+      next.speakers = patch?.speakers === undefined
+        ? normalizeSpeakers(base.speakers)
+        : normalizeSpeakers(patch.speakers)
       doc.meetings[index] = next
       updated = next
+    })
+    return updated
+  }
+
+  /** Replace one meeting's speaker list outright. */
+  async setSpeakers(id, speakers, options = {}) {
+    const now = options.now ?? new Date()
+    let updated = null
+    await this.update((doc) => {
+      const meeting = doc.meetings.find((entry) => entry.id === id)
+      if (meeting === undefined) throw new Error(`未找到会议：${id}`)
+      meeting.speakers = normalizeSpeakers(speakers)
+      meeting.updatedAt = now.toISOString()
+      updated = meeting
+    })
+    return updated
+  }
+
+  /**
+   * Append one speaker unless the id is already known (atomic, so two live
+   * slices identifying different voices cannot overwrite each other's list).
+   */
+  async addSpeaker(id, speaker, options = {}) {
+    const now = options.now ?? new Date()
+    const normalized = normalizeSpeakers([speaker])[0]
+    if (normalized === undefined) throw new Error('说话人信息不合法：需要形如 { id: "speaker-1", label: "说话人1" }')
+    let updated = null
+    await this.update((doc) => {
+      const meeting = doc.meetings.find((entry) => entry.id === id)
+      if (meeting === undefined) throw new Error(`未找到会议：${id}`)
+      if (!meeting.speakers.some((entry) => entry.id === normalized.id)) meeting.speakers.push(normalized)
+      meeting.updatedAt = now.toISOString()
+      updated = meeting
+    })
+    return updated
+  }
+
+  /**
+   * Rename one speaker: update the registry label and rewrite the `旧标签：`
+   * prefix in both `transcript` and `transcriptRaw`. Prefix rewriting is a
+   * label change, not a hand edit, so `transcriptEdits` is left untouched.
+   */
+  async renameSpeaker(id, speakerId, name, options = {}) {
+    const now = options.now ?? new Date()
+    const label = typeof name === 'string' ? name.trim() : ''
+    if (label === '') throw new Error('说话人名称不能为空')
+    if (label.length > 40) throw new Error('说话人名称过长（最多 40 个字）')
+    let updated = null
+    await this.update((doc) => {
+      const meeting = doc.meetings.find((entry) => entry.id === id)
+      if (meeting === undefined) {
+        const error = new Error(`未找到会议：${id}`)
+        error.status = 404
+        throw error
+      }
+      const speaker = meeting.speakers.find((entry) => entry.id === speakerId)
+      if (speaker === undefined) {
+        const error = new Error(`未找到说话人：${speakerId}`)
+        error.status = 404
+        throw error
+      }
+      const previousLabel = speaker.label
+      const nextLabel = label
+      speaker.label = nextLabel
+      meeting.transcript = replaceSpeakerPrefix(meeting.transcript, previousLabel, nextLabel)
+      meeting.transcriptRaw = replaceSpeakerPrefix(meeting.transcriptRaw, previousLabel, nextLabel)
+      meeting.updatedAt = now.toISOString()
+      updated = meeting
     })
     return updated
   }
@@ -313,6 +437,9 @@ export class MeetingStore {
       if (meeting === undefined) throw new Error(`未找到会议：${id}`)
       if (addition !== '') {
         meeting.transcript = meeting.transcript === '' ? addition : `${meeting.transcript}\n${addition}`
+        // While nobody has hand-edited this meeting, the raw ASR text mirrors
+        // the transcript; the first manual edit freezes it.
+        if (Number(meeting.transcriptEdits) === 0) meeting.transcriptRaw = meeting.transcript
       }
       meeting.transcriptSeconds = Math.round((meeting.transcriptSeconds + Math.max(0, Number(audioSeconds) || 0)) * 10) / 10
       meeting.updatedAt = now.toISOString()

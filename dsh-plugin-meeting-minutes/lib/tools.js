@@ -10,11 +10,13 @@
  * @module dsh-plugin-meeting-minutes/tools
  */
 
+import { readFile } from 'node:fs/promises'
 import { basename } from 'node:path'
 
 import { isGenericTitle, meetingLine, projectMeeting, todoProgress } from './model.js'
 import { sortMeetings } from './store.js'
-import { exportMeeting } from './export.js'
+import { audioSourceLabel, exportMeeting } from './export.js'
+import { storeAudio } from './audio-store.js'
 
 /** Every tool declares a text-only canonical value. */
 const TEXT_OUTPUT = {
@@ -49,6 +51,10 @@ function locate(store, args) {
 /** Human-readable block for one summarized meeting. */
 export function describeMeeting(meeting, options = {}) {
   const lines = [meetingLine(meeting)]
+  const audioLabel = audioSourceLabel(meeting)
+  if (audioLabel !== '') lines.push(`录音来源：${audioLabel}`)
+  if (meeting.audioError !== '') lines.push(`转写失败原因：${meeting.audioError}（可对同一会议重新转写）`)
+  if (meeting.transcriptEdits > 0) lines.push(`转写：经人工修订 ${meeting.transcriptEdits} 次（原文已保留，导出会标注）`)
   const summary = meeting.summary
   if (summary === null) {
     lines.push('（还没有生成纪要）')
@@ -89,6 +95,28 @@ export function describeMeeting(meeting, options = {}) {
   return lines.join('\n')
 }
 
+/** 统计 transcript 里以某个说话人标签开头的行数。 */
+function countSpeakerLines(transcript, label) {
+  if (typeof transcript !== 'string' || transcript === '' || label === '') return 0
+  const prefix = `${label}：`
+  return transcript.split('\n').filter((line) => line.startsWith(prefix)).length
+}
+
+/** 说话人列表的中文描述（工具输出）。 */
+export function describeSpeakers(meeting) {
+  const speakers = Array.isArray(meeting.speakers) ? meeting.speakers : []
+  if (speakers.length === 0) {
+    return `会议「${meeting.title}」还没有识别出说话人。\n说明：只有实时录音（按停顿切片转写）才会自动加说话人标签；导入的录音/文本没有说话人信息。`
+  }
+  const lines = [`会议「${meeting.title}」共有 ${speakers.length} 位说话人：`]
+  for (const speaker of speakers) {
+    const turns = countSpeakerLines(meeting.transcript, speaker.label)
+    lines.push(`- [${speaker.id}] ${speaker.label}${turns > 0 ? ` · ${turns} 段` : ''}`)
+  }
+  lines.push('可以用 meeting_speakers（action=rename, speakerId=..., name=张三）把说话人改成人名，转写里的旧标签会同步替换。')
+  return lines.join('\n')
+}
+
 /**
  * Register the meeting tools.
  * @param ctx - Cordis context carrying the `tools` service.
@@ -96,7 +124,7 @@ export function describeMeeting(meeting, options = {}) {
  * @returns disposers for every registration.
  */
 export function registerTools(ctx, deps) {
-  const { store, asr, summarizer, calendar, autoIngest } = deps
+  const { store, asr, summarizer, calendar, autoIngest, speakerTagger } = deps
   const disposers = []
 
   disposers.push(ctx.tools.register({
@@ -195,8 +223,9 @@ export function registerTools(ctx, deps) {
   disposers.push(ctx.tools.register({
     name: 'meeting_transcribe',
     description: [
-      '把本机一段录音/视频文件转成文字，并自动新建会议记录（本机 SenseVoice 离线识别，16kHz 单声道 WAV，长音频自动切片）。',
+      '把本机一段录音/视频文件转成文字，并自动新建会议记录。默认走本机 VoiceStudio（accurate + 说话人分离，转写里带「说话人N：」前缀、可再用 meeting_speakers 改名）；VoiceStudio 没开时自动回退宿主的 SenseVoice 离线识别。',
       '支持 wav/mp3/m4a/mp4/aac 等；非 16kHz WAV 会先用 macOS afconvert 转换。',
+      '转写前会把音频复制到会议数据目录并记录 sha256，转写失败也保留副本，可对同一会议重试。',
       '典型用法：用户说“把这个会议录音转成纪要”，你先找到文件绝对路径，再调用本工具；随后调用 meeting_summarize。',
     ].join(''),
     parameters: {
@@ -214,25 +243,81 @@ export function registerTools(ctx, deps) {
     output: TEXT_OUTPUT,
     async execute(args) {
       const audioPath = requireText(args?.audioPath, 'audioPath')
-      const result = await asr.transcribeFile(audioPath, { language: args?.language ?? 'zh' })
-      if (result.text.trim() === '') throw new Error('识别结果为空：音频可能没有语音，或语种不受支持。')
+      let bytes
+      try {
+        bytes = await readFile(audioPath)
+      } catch (error) {
+        if (error?.code === 'ENOENT') throw new Error(`音频文件不存在：${audioPath}`)
+        throw new Error(`读取音频文件失败：${error instanceof Error ? error.message : String(error)}`)
+      }
       const title = typeof args?.title === 'string' && args.title.trim() !== '' ? args.title.trim() : basename(audioPath)
+      // Create the record first: a failed ASR run still leaves a traceable entry
+      // pointing at the retained audio copy.
       const meeting = await store.add({
         title,
         date: args?.date,
         attendees: args?.attendees,
-        transcript: result.text,
-        transcriptSeconds: result.audioSeconds,
+        transcript: '',
+        transcriptSeconds: 0,
         sourceType: 'recording',
+        audioOriginalName: basename(audioPath),
       })
+      let audio = null
+      let copyError = ''
+      try {
+        audio = await storeAudio({ bytes, sourceName: audioPath, title, date: meeting.date })
+        await store.patch(meeting.id, {
+          audioPath: audio.relPath,
+          audioSha256: audio.sha256,
+          audioBytes: audio.bytes,
+          audioOriginalName: basename(audioPath),
+        })
+      } catch (error) {
+        copyError = error instanceof Error ? error.message : String(error)
+      }
+      const duplicate = audio === null ? null : store.findByAudioSha256(audio.sha256)
+      const duplicateLine = duplicate === null || duplicate.id === meeting.id
+        ? ''
+        : `注意：同一录音已在会议 ${duplicate.id}「${duplicate.title}」里，本次仍新建了记录。`
+      let result
+      try {
+        result = await asr.transcribeFile(audioPath, { language: args?.language ?? 'zh' })
+        if (result.text.trim() === '') throw new Error('识别结果为空：音频可能没有语音，或语种不受支持。')
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        await store.patch(meeting.id, { audioError: message })
+        const kept = audio === null ? (copyError === '' ? '未保留' : `未保留（${copyError}）`) : audio.relPath
+        throw new Error(`${message}\n音频副本：${kept}\n会议记录已建立（${meeting.id}），可对同一会议重试转写。`)
+      }
+      const updated = await store.appendTranscript(meeting.id, result.text, result.audioSeconds)
+      await store.patch(meeting.id, { audioSeconds: result.audioSeconds, audioError: '' })
+      // VoiceStudio 的 diarization 结果：把说话人登记进会议，transcript 里的
+      // 「说话人N：」前缀就能被 meeting_speakers 改名（和实时录音同一套链路）。
+      let speakerNote = ''
+      if (Array.isArray(result.speakers) && result.speakers.length > 0) {
+        try {
+          await store.setSpeakers(meeting.id, result.speakers)
+          speakerNote = `说话人：识别出 ${result.speakers.length} 位（可用 meeting_speakers 改名）`
+        } catch (error) {
+          speakerNote = `说话人登记失败：${error instanceof Error ? error.message : String(error)}`
+        }
+      }
+      const backendNote = result.backend === 'voicestudio'
+        ? `转写后端：VoiceStudio（accurate${result.diarizationError === '' ? '' : `，说话人分离失败：${result.diarizationError}`}）`
+        : '转写后端：宿主 SenseVoice'
       const preview = result.text.length > 500 ? `${result.text.slice(0, 500)}…` : result.text
+      const label = audioSourceLabel(updated ?? meeting)
       return [
-        `已转写 ${Math.round(result.audioSeconds)} 秒音频并创建会议：${meetingLine(meeting)}`,
+        `已转写 ${Math.round(result.audioSeconds)} 秒音频并创建会议：${meetingLine(updated ?? meeting)}`,
+        label === '' ? '' : `录音来源：${label}`,
+        backendNote,
+        speakerNote,
         `识别耗时 ${Math.round(result.inferenceSeconds)} 秒，文本 ${result.text.length} 字。`,
+        duplicateLine,
         '识别结果预览：',
         preview,
         `下一步：调用 meeting_summarize（id: ${meeting.id}）生成结构化纪要。`,
-      ].join('\n')
+      ].filter((line) => line !== '').join('\n')
     },
   }))
 
@@ -379,6 +464,49 @@ export function registerTools(ctx, deps) {
         status.recent.length === 0 ? '' : `- 最近自动导入：${status.recent.map((entry) => entry.title || entry.path).join('；')}`,
       ].filter((line) => line !== '')
       return lines.join('\n')
+    },
+  }))
+
+  disposers.push(ctx.tools.register({
+    name: 'meeting_speakers',
+    description: [
+      '查看或修改一场会议的说话人标签。实时录音转写时会用本地声纹识别自动给每段文本加「说话人N：」前缀。',
+      'action=list 列出已识别的说话人与各自的段数；action=rename 把某个 speakerId 改成人名（如 说话人1 → 张三），',
+      '并同步替换 transcript 与 transcriptRaw 里的旧前缀。导入的录音/文本没有说话人信息。',
+    ].join(''),
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        id: { type: 'string', description: '会议 id' },
+        match: { type: 'string', description: '标题关键词（唯一匹配时使用）' },
+        action: { type: 'string', enum: ['list', 'rename'], description: '操作：list 查看，rename 改名' },
+        speakerId: { type: 'string', description: 'action=rename 时的说话人 id（如 speaker-1）' },
+        name: { type: 'string', description: 'action=rename 时的新名字（如 张三）' },
+      },
+      required: ['action'],
+    },
+    output: TEXT_OUTPUT,
+    async execute(args) {
+      await store.load()
+      const meeting = locate(store, args)
+      const action = typeof args?.action === 'string' ? args.action.trim() : 'list'
+      if (action === 'list') return describeSpeakers(meeting)
+      if (action !== 'rename') throw new Error(`未知 action：${action}（可用 list / rename）`)
+      const speakerId = requireText(args?.speakerId, 'speakerId')
+      const name = requireText(args?.name, 'name')
+      if (!meeting.speakers.some((entry) => entry.id === speakerId)) {
+        const error = new Error(`未找到说话人：${speakerId}（先用 action=list 查看）`)
+        error.status = 404
+        throw error
+      }
+      const updated = await store.renameSpeaker(meeting.id, speakerId, name)
+      try {
+        if (typeof speakerTagger?.rename === 'function') speakerTagger.rename(meeting.id, speakerId, name)
+      } catch {
+        // The in-memory registry is an optimization; the store is the truth.
+      }
+      return [`已把 ${speakerId} 重命名为「${name}」，转写里的旧标签已同步替换。`, describeSpeakers(updated)].join('\n')
     },
   }))
 

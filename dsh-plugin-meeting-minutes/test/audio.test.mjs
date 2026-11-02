@@ -23,6 +23,7 @@ import {
   WAV_HEADER_BYTES,
   concatText,
   encodeWavPcm16,
+  pcm16ToFloat32,
   secondsOf,
   splitWav,
   toCanonicalWav,
@@ -535,4 +536,31 @@ test('createAsr: transcribeFile 对不存在的文件与空路径抛中文错误
   const asr = createAsr({ ctx: fakeContext(undefined) })
   await assert.rejects(asr.transcribeFile('/nonexistent/dsh-asr-test.mp3'), /音频文件不存在/)
   await assert.rejects(asr.transcribeFile(''), /路径不能为空/)
+})
+
+test('pcm16ToFloat32: Int16LE 负载解码成 [-1, 1] 浮点采样', () => {
+  const wav = encodeWavPcm16(new Int16Array([0, 16384, -32768, 32767, -16384]))
+  const samples = pcm16ToFloat32(wav)
+  assert.equal(samples instanceof Float32Array, true)
+  assert.equal(samples.length, 5)
+  assert.equal(samples[0], 0)
+  assert.ok(Math.abs(samples[1] - 0.5) < 1e-6)
+  assert.equal(samples[2], -1)
+  assert.ok(Math.abs(samples[3] - 32767 / 32768) < 1e-6)
+  assert.ok(Math.abs(samples[4] - -0.5) < 1e-6)
+})
+
+test('pcm16ToFloat32: 按 data 偏移读（LIST 块在前的 WAV），不合格输入抛中文错误', () => {
+  const frames = 4
+  const wav = craftWavWithList(frames)
+  const dataOffset = 12 + 24 + 12 + 8
+  const view = new DataView(wav.buffer, wav.byteOffset + dataOffset, frames * 2)
+  const samples = pcm16ToFloat32(wav)
+  assert.equal(samples.length, frames)
+  for (let index = 0; index < frames; index += 1) {
+    assert.ok(Math.abs(samples[index] - view.getInt16(index * 2, true) / 32768) < 1e-6)
+  }
+
+  assert.throws(() => pcm16ToFloat32(new Uint8Array([1, 2, 3])), CHINESE)
+  assert.throws(() => pcm16ToFloat32(craftWav({ sampleRate: 44100 })), /16000/)
 })

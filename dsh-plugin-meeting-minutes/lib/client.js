@@ -13,7 +13,8 @@
  *
  * Audio pipeline (browser side):
  *   - live: getUserMedia → AudioContext → ScriptProcessor(4096) → streaming
- *     resampler → 5 s PCM16 WAV chunks → rolling POST /transcribe (append).
+ *     resampler → energy-VAD sentence slices (≈3 s pause by default) → PCM16 WAV
+ *     chunks → rolling POST /transcribe (append).
  *   - file: decodeAudioData → 16 kHz mono → ≤90 s WAV slices → sequential POST.
  *   The live recorder lives at module scope and survives modal/panel unmounts.
  */
@@ -34,6 +35,8 @@ window.__ModuleLoader__.load({
     const SPEECH_POLL_MS = 1200
     const SPEECH_TIMEOUT_MS = 10 * 60 * 1000
     const TOAST_TTL_MS = 7000
+    /** How long the "录音已结束" notice stays up after an agent recording stops. */
+    const RECORDING_ENDED_TTL_MS = 3000
     const AUDIO_MAX_SECONDS = 60 * 60
 
     const PRIORITY_LABELS = { high: '高', normal: '中', low: '低' }
@@ -50,14 +53,254 @@ window.__ModuleLoader__.load({
       failed: '失败',
       cancelled: '已取消',
     }
-    /** Live capture: one WAV chunk every five seconds of audio. */
-    const LIVE_FLUSH_SECONDS = 5
-    const LIVE_FLUSH_FRAMES = TARGET_RATE * LIVE_FLUSH_SECONDS
+    // #region live-vad-core
+    // Pure energy-VAD core. This region is extracted verbatim by
+    // `test/live-vad.test.mjs` and executed in a bare VM context, so it must be
+    // self-contained: no DOM globals, no plugin store, no outer-scope references.
+    // The browser wrapper feeds 16 kHz mono Float32 blocks in and turns every
+    // emitted slice into one rolling transcription request.
+
+    /** Pause length before a sentence is sliced when nothing else is stored. */
+    const LIVE_VAD_DEFAULT_SILENCE_SECONDS = 1.5
+    /** User-selectable pause lengths, in seconds; anything else falls back to the default. */
+    const LIVE_VAD_SILENCE_OPTIONS = [1.5, 3, 5]
+    /** Browser storage key for the pause preference (applies to the next take). */
+    const LIVE_VAD_SILENCE_KEY = 'dsh.meeting.vad.silenceSeconds'
+    /** A blip shorter than this is never sliced out on its own. */
+    const LIVE_VAD_MIN_SENTENCE_SECONDS = 0.35
+    /** Continuous talking is force-sliced at this length. */
+    const LIVE_VAD_MAX_SENTENCE_SECONDS = 10
+    /** Audio kept from just before the onset so the first syllable is not clipped. */
+    const LIVE_VAD_PREROLL_SECONDS = 0.3
+    /** Trailing silence kept inside a slice; anything newer is dropped. */
+    const LIVE_VAD_TAIL_SILENCE_SECONDS = 0.2
+    /** Analysis frame: 10 ms at 16 kHz. */
+    const LIVE_VAD_FRAME_SECONDS = 0.01
+    /** Speech must clear max(absolute floor, tracked room tone × factor). */
+    const LIVE_VAD_NOISE_FLOOR_MIN = 0.004
+    const LIVE_VAD_NOISE_FLOOR_FACTOR = 2.2
+    /** Slow one-pole room-tone tracking (~1 s time constant at 10 ms frames). */
+    const LIVE_VAD_NOISE_ALPHA = 0.01
+    /** Sample rate used when the caller does not provide one. */
+    const LIVE_VAD_SAMPLE_RATE = 16000
+
+    /** Coerce a stored/select value into one of 1.5 / 3 / 5 (default 1.5). */
+    function normalizeVadSilenceSeconds(value) {
+      const seconds = typeof value === 'number' ? value : Number.parseFloat(String(value ?? ''))
+      for (const option of LIVE_VAD_SILENCE_OPTIONS) {
+        if (seconds === option) return option
+      }
+      return LIVE_VAD_DEFAULT_SILENCE_SECONDS
+    }
+
+    function vadFrameRms(frame) {
+      if (frame.length === 0) return 0
+      let energy = 0
+      for (let index = 0; index < frame.length; index += 1) energy += frame[index] * frame[index]
+      return Math.sqrt(energy / frame.length)
+    }
+
+    function vadConcatFrames(frames) {
+      let total = 0
+      for (const frame of frames) total += frame.length
+      const merged = new Float32Array(total)
+      let offset = 0
+      for (const frame of frames) {
+        merged.set(frame, offset)
+        offset += frame.length
+      }
+      return merged
+    }
+
+    /**
+     * Sentence slicer state machine: silent → speaking → (pause long enough, or
+     * sentence too long) → one slice. `push(block)` returns the slices that became
+     * ready; `flush()` drains whatever is left when recording stops; `getState()`
+     * exposes the counters used by the UI and by the unit tests.
+     */
+    function createLiveVad(options = {}) {
+      const requestedRate = Number(options.sampleRate)
+      const sampleRate = Number.isFinite(requestedRate) && requestedRate > 0
+        ? Math.round(requestedRate)
+        : LIVE_VAD_SAMPLE_RATE
+      const silenceTarget = normalizeVadSilenceSeconds(options.silenceSeconds)
+      const frameSamples = Math.max(1, Math.round(sampleRate * LIVE_VAD_FRAME_SECONDS))
+      const frameSeconds = frameSamples / sampleRate
+      const prerollFrames = Math.max(1, Math.round(LIVE_VAD_PREROLL_SECONDS / frameSeconds))
+      const tailFrames = Math.max(0, Math.round(LIVE_VAD_TAIL_SILENCE_SECONDS / frameSeconds))
+      const minSpeechFrames = Math.max(1, Math.round(LIVE_VAD_MIN_SENTENCE_SECONDS / frameSeconds))
+      const silenceFrames = Math.max(1, Math.round(silenceTarget / frameSeconds))
+      const maxSpeechFrames = Math.max(1, Math.round(LIVE_VAD_MAX_SENTENCE_SECONDS / frameSeconds))
+      const minSliceSamples = Math.round(sampleRate * LIVE_VAD_TAIL_SILENCE_SECONDS)
+
+      let state = 'silent'
+      /** Frames of the current sentence: preroll + speech + trailing silence. */
+      let pending = []
+      /** Most recent frames, replayed as the next onset's preroll. */
+      let ring = []
+      /** Incomplete frame left over between audio callbacks. */
+      let remainder = new Float32Array(0)
+      /** Speech frames in the current sentence (the "current sentence length"). */
+      let speechFrames = 0
+      /** Trailing silence frames inside the current sentence. */
+      let silenceRun = 0
+      let noiseFloor = LIVE_VAD_NOISE_FLOOR_MIN / LIVE_VAD_NOISE_FLOOR_FACTOR
+
+      function threshold() {
+        return Math.max(LIVE_VAD_NOISE_FLOOR_MIN, noiseFloor * LIVE_VAD_NOISE_FLOOR_FACTOR)
+      }
+
+      function pushRing(frame) {
+        ring.push(frame)
+        while (ring.length > prerollFrames) ring.shift()
+      }
+
+      function resetSentence() {
+        pending = []
+        speechFrames = 0
+        silenceRun = 0
+        state = 'silent'
+      }
+
+      /** Build the slice for the current sentence, trimming its trailing silence. */
+      function buildSlice(reason) {
+        if (pending.length === 0) return null
+        const drop = Math.max(0, silenceRun - tailFrames)
+        const kept = drop === 0 ? pending : pending.slice(0, Math.max(0, pending.length - drop))
+        const samples = vadConcatFrames(kept)
+        if (samples.length < minSliceSamples) return null
+        return {
+          samples,
+          reason,
+          sampleRate,
+          durationSeconds: samples.length / sampleRate,
+          speechSeconds: speechFrames * frameSeconds,
+          silenceSeconds: silenceRun * frameSeconds,
+        }
+      }
+
+      function handleFrame(frame, out) {
+        const rms = vadFrameRms(frame)
+        const speech = rms >= threshold()
+        if (state === 'silent') {
+          if (!speech) {
+            // Learn the room tone slowly; speech must never train the floor.
+            noiseFloor += (rms - noiseFloor) * LIVE_VAD_NOISE_ALPHA
+            pushRing(frame)
+            return
+          }
+          state = 'speaking'
+          pending = ring.slice(-prerollFrames)
+          pending.push(frame)
+          speechFrames = 1
+          silenceRun = 0
+          pushRing(frame)
+          return
+        }
+        pending.push(frame)
+        pushRing(frame)
+        if (speech) {
+          speechFrames += 1
+          silenceRun = 0
+        } else {
+          silenceRun += 1
+          // Pauses inside a sentence also teach the floor, so a noisy room does
+          // not keep being sliced as one 10 s sentence forever.
+          noiseFloor += (rms - noiseFloor) * LIVE_VAD_NOISE_ALPHA
+        }
+        if (speechFrames >= maxSpeechFrames) {
+          const slice = buildSlice('maxSentence')
+          if (slice !== null) out.push(slice)
+          // Still talking: start the next sentence right here.
+          pending = []
+          speechFrames = 0
+          silenceRun = 0
+          return
+        }
+        if (silenceRun >= silenceFrames) {
+          if (speechFrames >= minSpeechFrames) {
+            const slice = buildSlice('silence')
+            if (slice !== null) out.push(slice)
+          }
+          resetSentence()
+        }
+      }
+
+      return {
+        push(samples) {
+          const out = []
+          if (!samples || samples.length === 0) return out
+          const incoming = samples instanceof Float32Array ? samples : Float32Array.from(samples)
+          const joined = new Float32Array(remainder.length + incoming.length)
+          joined.set(remainder, 0)
+          joined.set(incoming, remainder.length)
+          let offset = 0
+          while (offset + frameSamples <= joined.length) {
+            handleFrame(joined.subarray(offset, offset + frameSamples), out)
+            offset += frameSamples
+          }
+          remainder = joined.slice(offset)
+          return out
+        },
+        /** Stop-recording drain: final slice, or null when < 200 ms is left. */
+        flush() {
+          if (remainder.length > 0) {
+            if (state === 'speaking') pending.push(remainder)
+            remainder = new Float32Array(0)
+          }
+          if (state !== 'speaking') {
+            resetSentence()
+            return null
+          }
+          const slice = buildSlice('stop')
+          resetSentence()
+          return slice
+        },
+        reset() {
+          ring = []
+          remainder = new Float32Array(0)
+          noiseFloor = LIVE_VAD_NOISE_FLOOR_MIN / LIVE_VAD_NOISE_FLOOR_FACTOR
+          resetSentence()
+        },
+        getState() {
+          return {
+            state,
+            speechSeconds: speechFrames * frameSeconds,
+            silenceRunSeconds: silenceRun * frameSeconds,
+            pendingFrames: pending.length,
+            noiseFloor,
+            threshold: threshold(),
+            silenceTargetSeconds: silenceTarget,
+            frameSeconds,
+          }
+        },
+      }
+    }
+
+    const liveVadCore = Object.freeze({
+      createLiveVad,
+      normalizeVadSilenceSeconds,
+      LIVE_VAD_DEFAULT_SILENCE_SECONDS,
+      LIVE_VAD_SILENCE_OPTIONS,
+      LIVE_VAD_SILENCE_KEY,
+      LIVE_VAD_MIN_SENTENCE_SECONDS,
+      LIVE_VAD_MAX_SENTENCE_SECONDS,
+      LIVE_VAD_PREROLL_SECONDS,
+      LIVE_VAD_TAIL_SILENCE_SECONDS,
+      LIVE_VAD_NOISE_FLOOR_MIN,
+      LIVE_VAD_NOISE_FLOOR_FACTOR,
+      LIVE_VAD_SAMPLE_RATE,
+    })
+
+    // The unit test extracts this region and runs it in a bare VM context with a
+    // fresh `exports` object; inside the plugin factory `exports` is the client
+    // module object, so the assignment is harmless in production.
+    if (typeof exports === 'object' && exports !== null) exports.liveVadCore = liveVadCore
+    // #endregion live-vad-core
+
     /** At most two transcription requests in flight; pending chunks merge. */
     const LIVE_MAX_INFLIGHT = 2
     const LIVE_MAX_PENDING = 2
-    /** Do not send a final sliver shorter than 200 ms. */
-    const LIVE_MIN_FRAMES = Math.round(TARGET_RATE * 0.2)
     const LIVE_IDLE_TIMEOUT_MS = 120 * 1000
 
     // ──────────────────────────────── styles ────────────────────────────────
@@ -220,6 +463,11 @@ button.dsm-chip:hover:not(:disabled){color:var(--dsw-alias-label-primary);border
 .dsm-todo-hint{font-size:11px;color:var(--dsw-alias-label-secondary);line-height:17px}
 .dsm-todo-hint--warn{color:var(--dsw-alias-state-warn-label)}
 .dsm-empty-table{padding:16px;text-align:center;font-size:12px;color:var(--dsw-alias-label-secondary)}
+.dsm-speakers{display:flex;align-items:center;gap:6px;flex-wrap:wrap;padding:2px 0 0}
+.dsm-speakers-label{font-size:11px;color:var(--dsw-alias-label-secondary)}
+.dsm-speaker-chip{max-width:180px;overflow:hidden;text-overflow:ellipsis}
+.dsm-speaker-edit{display:inline-flex;align-items:center;gap:4px}
+.dsm-speaker-input{width:132px;box-sizing:border-box}
 .dsm-transcript{border:1px solid var(--dsw-alias-border-l1);border-radius:13px;background:var(--dsw-alias-bg-layer-1);overflow:hidden}
 .dsm-transcript-head{display:flex;align-items:center;gap:8px;padding:9px 12px;flex-wrap:wrap}
 .dsm-transcript-toggle{display:inline-flex;align-items:center;gap:5px;border:0;background:transparent;color:var(--dsw-alias-label-primary);font-family:inherit;font-size:12px;font-weight:600;cursor:pointer;padding:0}
@@ -294,7 +542,10 @@ button.dsm-chip:hover:not(:disabled){color:var(--dsw-alias-label-primary);border
 .dsm-icon-dot{position:absolute;top:-3px;right:-4px;min-width:12px;height:12px;border-radius:999px;background:var(--dsw-alias-button-primary-fill);color:var(--dsw-alias-label-primary-foreground);font-size:9px;line-height:12px;text-align:center;padding:0 3px;font-weight:600}
 .dsm-dialog-text{font-size:12.5px;line-height:20px;color:var(--dsw-alias-label-secondary);margin:0;word-break:break-word}
 .dsm-kbd{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:10.5px;border:1px solid var(--dsw-alias-border-l1);border-radius:4px;padding:0 3px;color:var(--dsw-alias-label-secondary)}
-.dsm-livebar{position:fixed;left:50%;bottom:18px;transform:translateX(-50%);z-index:210;display:flex;align-items:center;gap:10px;max-width:min(780px,94vw);box-sizing:border-box;padding:8px 10px 8px 12px;border:1px solid color-mix(in srgb,var(--dsw-alias-state-error-primary) 55%,var(--dsw-alias-border-l2));border-radius:12px;background:var(--dsw-alias-toast-bg);color:var(--dsw-alias-toast-label);box-shadow:0 12px 34px color-mix(in srgb,var(--dsw-alias-label-primary) 24%,transparent)}
+.dsm-livebar{position:fixed;cursor:grab;touch-action:none;user-select:none;left:50%;bottom:18px;transform:translateX(-50%);z-index:210;display:flex;align-items:center;gap:10px;max-width:min(780px,94vw);box-sizing:border-box;padding:8px 10px 8px 12px;border:1px solid color-mix(in srgb,var(--dsw-alias-state-error-primary) 55%,var(--dsw-alias-border-l2));border-radius:12px;background:var(--dsw-alias-toast-bg);color:var(--dsw-alias-toast-label);box-shadow:0 12px 34px color-mix(in srgb,var(--dsw-alias-label-primary) 24%,transparent)}
+.dsm-livebar[data-dsm-dragging]{cursor:grabbing}
+.dsm-livebar--done{border-color:color-mix(in srgb,var(--dsw-alias-state-success-primary) 60%,var(--dsw-alias-border-l2))}
+.dsm-livebar-check{width:18px;height:18px;flex:0 0 auto;display:flex;align-items:center;justify-content:center;border-radius:50%;background:color-mix(in srgb,var(--dsw-alias-state-success-primary) 22%,transparent);color:var(--dsw-alias-state-success-primary);font-size:11px;font-weight:700}
 .dsm-livebar-dot{width:9px;height:9px;border-radius:50%;background:var(--dsw-alias-state-error-primary);animation:dsm-pulse 1.2s ease-in-out infinite;flex:0 0 auto}
 .dsm-livebar-main{flex:1 1 260px;min-width:0;display:flex;flex-direction:column;gap:2px}
 .dsm-livebar-title{display:flex;align-items:center;gap:7px;font-size:12.5px;font-weight:650;white-space:nowrap}
@@ -304,6 +555,10 @@ button.dsm-chip:hover:not(:disabled){color:var(--dsw-alias-label-primary);border
 .dsm-livebar .dsm-btn{color:var(--dsw-alias-toast-label);border-color:color-mix(in srgb,var(--dsw-alias-toast-label) 24%,transparent)}
 .dsm-livebar .dsm-btn:hover:not(:disabled){background:color-mix(in srgb,var(--dsw-alias-toast-label) 12%,transparent);color:var(--dsw-alias-toast-label)}
 .dsm-livebar .dsm-btn--danger{color:var(--dsw-alias-label-error);border-color:color-mix(in srgb,var(--dsw-alias-label-error) 55%,transparent)}
+.dsm-livebar-select{display:inline-flex;align-items:center;gap:3px;font-size:11px;color:var(--dsw-alias-toast-label);white-space:nowrap;cursor:pointer}
+.dsm-livebar-select select{appearance:none;-webkit-appearance:none;border:1px solid color-mix(in srgb,var(--dsw-alias-toast-label) 26%,transparent);border-radius:6px;background:transparent;color:inherit;font-family:inherit;font-size:11px;line-height:16px;padding:1px 5px;cursor:pointer}
+.dsm-livebar-select select:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:1px}
+.dsm-livebar-select select option{color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-base)}
 .dsm-live-panel{display:flex;flex-direction:column;gap:10px;padding:4px 0 2px}
 .dsm-live-head{display:flex;align-items:center;gap:8px;font-size:13px;font-weight:600;word-break:break-word}
 .dsm-live-head .dsm-livebar-dot{width:10px;height:10px}
@@ -375,6 +630,8 @@ button.dsm-chip:hover:not(:disabled){color:var(--dsw-alias-label-primary);border
       speechMessage: '',
       speechPreparing: false,
       live: initialLiveState(),
+      /** Brief "recording finished" notice shown after an agent recording stops. */
+      recordingEnded: null,
       toasts: [],
     }
     const listeners = new Set()
@@ -705,6 +962,54 @@ button.dsm-chip:hover:not(:disabled){color:var(--dsw-alias-label-primary);border
         if (!options.quiet) reportError(error, '会议加载失败')
         return null
       }
+    }
+
+    /**
+     * Normalise `meeting.speakers` (host contract: `[{ id, label }]`). Anything
+     * else — missing field, old host, empty array — collapses to `[]`.
+     */
+    function normalizeSpeakerList(value) {
+      if (!Array.isArray(value)) return []
+      const list = []
+      for (const item of value) {
+        if (item === null || typeof item !== 'object') continue
+        const rawId = item.id
+        const id = typeof rawId === 'string' ? rawId : (typeof rawId === 'number' ? String(rawId) : '')
+        if (id === '') continue
+        const label = typeof item.label === 'string' && item.label.trim() !== ''
+          ? item.label.trim()
+          : `说话人${list.length + 1}`
+        list.push({ id, label })
+      }
+      return list
+    }
+
+    /**
+     * Speaker list for a meeting. Returns `null` when the host does not implement
+     * the route yet (404 / old build), so callers can stay silent instead of
+     * flashing an error for a feature the backend is still adding.
+     */
+    async function loadMeetingSpeakers(meetingId) {
+      if (!meetingId) return null
+      try {
+        const payload = await requestJson(`/meetings/${encodeURIComponent(meetingId)}/speakers`)
+        if (!payload || payload.ok !== true) return null
+        return normalizeSpeakerList(payload.speakers)
+      } catch {
+        return null
+      }
+    }
+
+    /** Rename one speaker label; resolves with the host payload. */
+    async function renameMeetingSpeaker(meetingId, speakerId, name) {
+      const payload = await requestJson(
+        `/meetings/${encodeURIComponent(meetingId)}/speakers/${encodeURIComponent(speakerId)}/rename`,
+        { method: 'POST', body: { name } },
+      )
+      if (payload?.meeting && payload.meeting.id === snapshot.selectedId) {
+        commit({ meeting: payload.meeting })
+      }
+      return payload
     }
 
     /**
@@ -1237,11 +1542,25 @@ button.dsm-chip:hover:not(:disabled){color:var(--dsw-alias-label-primary);border
       return chunks
     }
 
-    async function postTranscription(meetingId, wavBlob) {
+    /**
+     * Query string for one transcribe POST.
+     * Live slices carry `live=1&index=N` so the host keeps them as temporary
+     * parts and merges the whole meeting once on stop (`/audio/finalize`).
+     */
+    function transcribeQuery(options = {}) {
+      const query = new URLSearchParams({ language: 'zh' })
+      if (options?.live === true) {
+        query.set('live', '1')
+        query.set('index', String(Math.max(0, Math.trunc(Number(options.index) || 0))))
+      }
+      return query.toString()
+    }
+
+    async function postTranscription(meetingId, wavBlob, options = {}) {
       let response
       try {
         response = await fetch(
-          `${API}/meetings/${encodeURIComponent(meetingId)}/transcribe?language=zh`,
+          `${API}/meetings/${encodeURIComponent(meetingId)}/transcribe?${transcribeQuery(options)}`,
           {
             method: 'POST',
             headers: { 'content-type': 'audio/wav' },
@@ -1340,6 +1659,26 @@ button.dsm-chip:hover:not(:disabled){color:var(--dsw-alias-label-primary);border
         && (live.status === 'preparing' || live.status === 'recording' || live.status === 'stopping')
     }
 
+    /** Pause preference from the browser (defaults to 1.5 s; never throws). */
+    function readVadSilenceSeconds() {
+      try {
+        return normalizeVadSilenceSeconds(window.localStorage.getItem(LIVE_VAD_SILENCE_KEY))
+      } catch {
+        return LIVE_VAD_DEFAULT_SILENCE_SECONDS
+      }
+    }
+
+    /** Persist the pause preference; it takes effect on the next recording. */
+    function writeVadSilenceSeconds(value) {
+      const seconds = normalizeVadSilenceSeconds(value)
+      try {
+        window.localStorage.setItem(LIVE_VAD_SILENCE_KEY, String(seconds))
+      } catch {
+        // Private mode / storage disabled: the in-memory selection still works.
+      }
+      return seconds
+    }
+
     /**
      * Streaming linear resampler. The fractional read position AND the unconsumed
      * source tail survive `push()` calls, so concatenated blocks stay continuous
@@ -1409,8 +1748,8 @@ button.dsm-chip:hover:not(:disabled){color:var(--dsw-alias-label-primary);border
       processor: null,
       sink: null,
       resampler: null,
-      accumulator: [],
-      accumulatedFrames: 0,
+      /** Per-take energy VAD; created in `startLiveRecording`. */
+      vad: null,
       queue: [],
       inFlight: 0,
       pumping: false,
@@ -1632,7 +1971,10 @@ button.dsm-chip:hover:not(:disabled){color:var(--dsw-alias-label-primary);border
       }
     }
 
-    /** Audio-thread callback: accumulate by AUDIO time, flush there (not by timer). */
+    /**
+     * Audio-thread callback: hand the resampled block to the energy VAD. The VAD
+     * owns slicing (natural pauses / 10 s cap), so nothing is flushed by a timer.
+     */
     function onLiveAudioProcess(event) {
       if (snapshot.live.status !== 'recording') return
       const input = event.inputBuffer?.getChannelData?.(0)
@@ -1644,24 +1986,21 @@ button.dsm-chip:hover:not(:disabled){color:var(--dsw-alias-label-primary);border
       liveEngine.level = Math.min(1, Math.sqrt(energy / mono.length) * 4)
       const resampled = liveEngine.resampler === null ? mono : liveEngine.resampler.push(mono)
       if (resampled.length === 0) return
-      liveEngine.accumulator.push(resampled)
-      liveEngine.accumulatedFrames += resampled.length
-      if (liveEngine.accumulatedFrames >= LIVE_FLUSH_FRAMES) flushLiveSamples(false)
+      const vad = liveEngine.vad
+      if (vad === null) return
+      for (const slice of vad.push(resampled)) enqueueLiveSamples(slice.samples)
     }
 
+    /**
+     * Drain the VAD. Stop-recording calls this with `force`; the VAD itself drops
+     * a final sliver shorter than 200 ms (and trims the trailing silence).
+     */
     function flushLiveSamples(force = false) {
-      const frames = liveEngine.accumulatedFrames
-      if (frames === 0) return
-      if (!force && frames < LIVE_FLUSH_FRAMES) return
-      if (force && frames < LIVE_MIN_FRAMES) {
-        liveEngine.accumulator = []
-        liveEngine.accumulatedFrames = 0
-        return
-      }
-      const merged = concatFloat32(liveEngine.accumulator)
-      liveEngine.accumulator = []
-      liveEngine.accumulatedFrames = 0
-      enqueueLiveSamples(merged)
+      if (!force) return
+      const vad = liveEngine.vad
+      if (vad === null) return
+      const slice = vad.flush()
+      if (slice !== null) enqueueLiveSamples(slice.samples)
     }
 
     function enqueueLiveSamples(samples) {
@@ -1731,7 +2070,10 @@ button.dsm-chip:hover:not(:disabled){color:var(--dsw-alias-label-primary);border
       const session = liveEngine.sessionId
       try {
         if (meetingId === null) throw new Error('录制的会议不存在，无法转写')
-        const payload = await postTranscription(meetingId, encodePcm16Wav(samples))
+        const payload = await postTranscription(meetingId, encodePcm16Wav(samples), {
+          live: true,
+          index: liveEngine.sentChunks,
+        })
         if (liveEngine.sessionId === session) applyLiveChunk(payload)
       } catch (error) {
         if (liveEngine.sessionId === session) handleLiveChunkError(error)
@@ -1779,8 +2121,7 @@ button.dsm-chip:hover:not(:disabled){color:var(--dsw-alias-label-primary);border
 
     function releaseLiveAudio() {
       stopLiveCapture()
-      liveEngine.accumulator = []
-      liveEngine.accumulatedFrames = 0
+      liveEngine.vad = null
       liveEngine.queue = []
       liveEngine.inFlight = 0
       liveEngine.pumping = false
@@ -1832,6 +2173,11 @@ button.dsm-chip:hover:not(:disabled){color:var(--dsw-alias-label-primary);border
         liveEngine.processor = capture.processor
         liveEngine.sink = capture.sink
         liveEngine.resampler = capture.resampler
+        // Read the pause preference now: a change in the bar applies to the next take.
+        liveEngine.vad = createLiveVad({
+          sampleRate: TARGET_RATE,
+          silenceSeconds: readVadSilenceSeconds(),
+        })
         capture.processor.onaudioprocess = onLiveAudioProcess
         publishLive({
           status: 'recording',
@@ -1874,6 +2220,20 @@ button.dsm-chip:hover:not(:disabled){color:var(--dsw-alias-label-primary);border
 
     async function finalizeLiveRecording(reason, idleOk) {
       const meetingId = snapshot.live.meetingId
+      // Merge the live slices into ONE retained copy before reading the meeting
+      // back, so the record already carries audioPath + whole-meeting sha256.
+      // A partial/errored stop still merges what was recorded.
+      if (meetingId !== null && liveEngine.sentChunks > 0) {
+        try {
+          const merged = await requestJson(`/meetings/${encodeURIComponent(meetingId)}/audio/finalize`, {
+            method: 'POST',
+            body: {},
+          })
+          if (merged.meeting) commit({ meeting: merged.meeting })
+        } catch (error) {
+          reportError(error, '整场录音合并失败')
+        }
+      }
       let meeting = null
       if (meetingId !== null) {
         try {
@@ -2989,7 +3349,7 @@ button.dsm-chip:hover:not(:disabled){color:var(--dsw-alias-label-primary);border
       const subtitle = liveStatus === 'preparing'
         ? '正在启动语音识别，就绪后自动开始录音。'
         : liveStatus === 'recording'
-          ? '实时转写约 6–10 秒延迟；关闭弹窗后仍在后台录音。'
+          ? '停顿约 1.5 秒自动切出一句；说完停一两秒就出字，关闭弹窗后仍在后台录音。'
           : liveStatus === 'stopping'
             ? '正在等待最后几段识别结果，完成后自动保存。'
             : liveStatus === 'done' || liveStatus === 'error'
@@ -3041,7 +3401,7 @@ button.dsm-chip:hover:not(:disabled){color:var(--dsw-alias-label-primary);border
               h('div', { className: 'dsm-live-last-label' }, '最近一句'),
               live.lastText !== ''
                 ? live.lastText
-                : (preparing ? '等待语音模型就绪…' : '等待第一段识别结果…（约 6–10 秒）'),
+                : (preparing ? '等待语音模型就绪…' : '等待第一段识别结果…（先说一句，停顿约 1.5 秒即出字）'),
             ),
             preparing ? h(SpeechProgressCard, { key: 'speech' }) : null,
             stopping
@@ -3055,7 +3415,7 @@ button.dsm-chip:hover:not(:disabled){color:var(--dsw-alias-label-primary);border
             h('div', { className: 'dsm-live-queue' }, `识别队列：在飞 ${live.inFlight} · 待发 ${live.queued} · 已发送 ${live.sentChunks} 段`),
             h('div', { className: 'dsm-hint' }, preparing
               ? '语音模型就绪后自动开始录音；关闭弹窗不会中断。'
-              : '可在后台录音，关闭弹窗不中断；停止后会等待所有在飞识别完成。'),
+              : `停顿 ${readVadSilenceSeconds()} 秒自动切出一句（可在浮条上调整）；可在后台录音，停止后会等待所有在飞识别完成。`),
           ),
         ]
       } else if (liveStatus === 'done') {
@@ -3153,7 +3513,7 @@ button.dsm-chip:hover:not(:disabled){color:var(--dsw-alias-label-primary);border
             })),
           ),
           h('div', { key: 'hint', className: 'dsm-hint' }, tab === 'record'
-            ? '实时转写约 6–10 秒延迟；标题可留空，会自动命名，之后可改（AI 生成纪要时也会自动起名）。可在后台录音，关闭弹窗不中断。'
+            ? '停顿约 1.5 秒自动切出一句（浮条上可改成 3 / 5 秒）；标题可留空，会自动命名，之后可改。可在后台录音，关闭弹窗不中断。'
             : '文件转写仍使用浏览器解码 → 16kHz 单声道 PCM16 WAV → 90 秒切片逐段识别；支持 WAV / MP3 / M4A / MP4 / WebM。'),
           speechAvailable
             ? null
@@ -3462,6 +3822,14 @@ button.dsm-chip:hover:not(:disabled){color:var(--dsw-alias-label-primary);border
         }),
         meeting.transcriptSeconds > 0
           ? h(MetaChip, { key: 'duration', icon: 'clock', label: `时长 ${formatDuration(meeting.transcriptSeconds)}` })
+          : null,
+        meeting.audioPath
+          ? h(MetaChip, {
+            key: 'audio',
+            icon: 'folder',
+            label: `录音副本${meeting.audioPrunedAt ? '（已清理）' : ''}${meeting.audioError ? ' · 转写失败' : ''}`,
+            title: meeting.audioPath,
+          })
           : null,
         h(MetaChip, { key: 'chars', icon: 'list', label: formatChars(meeting.transcriptChars ?? (meeting.transcript ?? '').length) }),
         summary?.generatedAt
@@ -3778,10 +4146,147 @@ button.dsm-chip:hover:not(:disabled){color:var(--dsw-alias-label-primary);border
       )
     }
 
+    /**
+     * Speaker chips shown right above the transcript. The host-side diarisation
+     * route is developed in parallel, so an unimplemented/old host degrades to
+     * "no chips" instead of an error banner.
+     */
+    function SpeakerChips(props) {
+      const meetingId = typeof props.meetingId === 'string' ? props.meetingId : ''
+      const incoming = normalizeSpeakerList(props.speakers)
+      const incomingKey = incoming.map((item) => `${item.id}:${item.label}`).join('|')
+      const [speakers, setSpeakers] = useState(incoming)
+      const [editingId, setEditingId] = useState(null)
+      const [draft, setDraft] = useState('')
+      const [saving, setSaving] = useState(false)
+      // Guards against re-fetching a route the host does not implement.
+      const fetchedFor = useRef('')
+
+      // A different meeting resets the local list, then lazily asks the host.
+      useEffect(() => {
+        setEditingId(null)
+        setDraft('')
+        setSpeakers(normalizeSpeakerList(props.speakers))
+        if (meetingId === '' || normalizeSpeakerList(props.speakers).length > 0) return undefined
+        if (fetchedFor.current === meetingId) return undefined
+        fetchedFor.current = meetingId
+        let cancelled = false
+        void loadMeetingSpeakers(meetingId).then((found) => {
+          if (cancelled || found === null || found.length === 0) return
+          setSpeakers(found)
+        })
+        return () => { cancelled = true }
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+      }, [meetingId])
+
+      // Fresh host data (meeting reloaded after a rename) wins over the local copy.
+      useEffect(() => {
+        if (incoming.length > 0) setSpeakers(incoming)
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+      }, [incomingKey])
+
+      if (speakers.length === 0) return null
+
+      const startEdit = (speaker) => {
+        setEditingId(speaker.id)
+        setDraft(speaker.label)
+      }
+      const cancelEdit = () => {
+        setEditingId(null)
+        setDraft('')
+      }
+      const save = async (speaker) => {
+        const name = draft.trim()
+        if (name === '' || name === speaker.label) {
+          cancelEdit()
+          return
+        }
+        setSaving(true)
+        try {
+          const payload = await renameMeetingSpeaker(meetingId, speaker.id, name)
+          const fromHost = normalizeSpeakerList(payload?.meeting?.speakers)
+          setSpeakers(fromHost.length > 0
+            ? fromHost
+            : speakers.map((item) => (item.id === speaker.id ? { ...item, label: name } : item)))
+          cancelEdit()
+          notifySuccess('已更新说话人', name)
+          void reloadMeetingQuietly(meetingId)
+        } catch (caught) {
+          reportError(caught, '更新说话人失败')
+        } finally {
+          setSaving(false)
+        }
+      }
+
+      return h(
+        'div',
+        { className: 'dsm-speakers', role: 'group', 'aria-label': '说话人' },
+        h('span', { className: 'dsm-speakers-label' }, '说话人'),
+        ...speakers.map((speaker) => (editingId === speaker.id
+          ? h(
+            'span',
+            { key: speaker.id, className: 'dsm-speaker-edit' },
+            h('input', {
+              className: 'dsm-input dsm-input--cell dsm-speaker-input',
+              value: draft,
+              autoFocus: true,
+              disabled: saving,
+              'aria-label': `重命名${speaker.label}`,
+              onChange: (event) => setDraft(event.target.value),
+              onKeyDown: (event) => {
+                if (event.key === 'Enter') {
+                  event.preventDefault()
+                  void save(speaker)
+                } else if (event.key === 'Escape') {
+                  event.preventDefault()
+                  cancelEdit()
+                }
+              },
+            }),
+            h('button', {
+              type: 'button',
+              className: 'dsm-btn dsm-btn--sm dsm-btn--primary',
+              onClick: () => { void save(speaker) },
+              disabled: saving,
+            }, h('span', null, saving ? '保存中…' : '保存')),
+            h('button', {
+              type: 'button',
+              className: 'dsm-btn dsm-btn--sm',
+              onClick: cancelEdit,
+              disabled: saving,
+            }, h('span', null, '取消')),
+          )
+          : h('button', {
+            key: speaker.id,
+            type: 'button',
+            className: 'dsm-chip dsm-speaker-chip',
+            title: '点击重命名说话人',
+            onClick: () => startEdit(speaker),
+          }, h(Icon, { name: 'edit', size: 10 }), h('span', null, speaker.label)))),
+      )
+    }
+
     function TranscriptSection(props) {
       const text = String(props.transcript ?? '')
+      const meetingId = typeof props.meetingId === 'string' ? props.meetingId : ''
+      const edits = Number(props.edits) || 0
       const [open, setOpen] = useState(false)
       const [copied, setCopied] = useState(false)
+      // `draft === null` means read-only; a string means the editor is open.
+      const [draft, setDraft] = useState(null)
+      const [saving, setSaving] = useState(false)
+      const dirty = draft !== null && draft !== text
+      // Hand-corrected ASR text must not be lost when the page is closed or the
+      // panel switches. Save goes through the existing PATCH route.
+      useEffect(() => {
+        if (!dirty) return undefined
+        const handler = (event) => {
+          event.preventDefault()
+          event.returnValue = ''
+        }
+        window.addEventListener('beforeunload', handler)
+        return () => window.removeEventListener('beforeunload', handler)
+      }, [dirty])
       const copy = async () => {
         try {
           await copyText(text)
@@ -3792,9 +4297,35 @@ button.dsm-chip:hover:not(:disabled){color:var(--dsw-alias-label-primary);border
           reportError(caught, '复制失败')
         }
       }
+      const startEdit = () => {
+        setDraft(text)
+        setOpen(true)
+      }
+      const cancelEdit = () => {
+        if (dirty && !window.confirm('转写有未保存的修改，确定放弃？')) return
+        setDraft(null)
+      }
+      const save = async () => {
+        if (draft === null || meetingId === '' || !dirty) return
+        setSaving(true)
+        try {
+          await patchMeeting(meetingId, { transcript: draft })
+          setDraft(null)
+          notifySuccess('转写已保存', '导出与重新生成纪要都会使用修订后的文本')
+        } catch (caught) {
+          reportError(caught, '保存转写失败')
+        } finally {
+          setSaving(false)
+        }
+      }
+      const toggle = () => {
+        if (dirty && !window.confirm('转写有未保存的修改，确定收起？')) return
+        setOpen((previous) => !previous)
+      }
+      const sub = `${formatChars(text.length)}${edits > 0 ? ` · 已修订 ${edits} 次` : ''}`
       return h(
         Section,
-        { title: '原始转写', icon: 'doc', sub: formatChars(text.length) },
+        { title: '原始转写', icon: 'doc', sub },
         h(
           'div',
           { className: 'dsm-transcript' },
@@ -3804,9 +4335,31 @@ button.dsm-chip:hover:not(:disabled){color:var(--dsw-alias-label-primary);border
             h('button', {
               type: 'button',
               className: 'dsm-transcript-toggle',
-              onClick: () => setOpen((previous) => !previous),
-            }, h(Icon, { name: 'chevron', size: 12, className: open ? 'dsm-chevron--open' : undefined }), h('span', null, open ? '收起转写' : '展开转写'), h('span', { className: 'dsm-transcript-meta' }, formatChars(text.length))),
+              onClick: toggle,
+            }, h(Icon, { name: 'chevron', size: 12, className: open ? 'dsm-chevron--open' : undefined }), h('span', null, open ? '收起转写' : '展开转写'), h('span', { className: 'dsm-transcript-meta' }, sub)),
             h('span', { className: 'dsm-spacer' }),
+            draft === null
+              ? h('button', {
+                type: 'button',
+                className: 'dsm-btn dsm-btn--sm',
+                onClick: startEdit,
+                disabled: text === '' || meetingId === '',
+                title: '手工修订转写里的错别字；原文保留在记录里',
+              }, h(Icon, { name: 'edit', size: 11 }), h('span', null, '编辑转写'))
+              : [
+                h('button', {
+                  type: 'button',
+                  className: 'dsm-btn dsm-btn--sm dsm-btn--primary',
+                  onClick: () => { void save() },
+                  disabled: saving || !dirty,
+                }, h('span', null, saving ? '保存中…' : '保存修订')),
+                h('button', {
+                  type: 'button',
+                  className: 'dsm-btn dsm-btn--sm',
+                  onClick: cancelEdit,
+                  disabled: saving,
+                }, h('span', null, '取消')),
+              ],
             h('button', {
               type: 'button',
               className: 'dsm-btn dsm-btn--sm',
@@ -3814,8 +4367,19 @@ button.dsm-chip:hover:not(:disabled){color:var(--dsw-alias-label-primary);border
               disabled: text === '',
             }, h(Icon, { name: 'copy', size: 11 }), h('span', null, copied ? '已复制' : '复制全文')),
           ),
+          dirty
+            ? h('div', { className: 'dsm-transcript-meta', style: { padding: '0 12px 8px' } }, '有未保存的修改：保存后才会用于导出和重新生成纪要')
+            : null,
           open
-            ? h('pre', { className: 'dsm-transcript-body' }, text === '' ? '（暂无转写文本）' : text)
+            ? (draft === null
+              ? h('pre', { className: 'dsm-transcript-body' }, text === '' ? '（暂无转写文本）' : text)
+              : h('textarea', {
+                className: 'dsm-input dsm-textarea dsm-transcript-body',
+                style: { borderRadius: 0, border: 0, minHeight: 220 },
+                value: draft,
+                onChange: (event) => setDraft(event.target.value),
+                spellCheck: false,
+              }))
             : null,
         ),
       )
@@ -4004,7 +4568,17 @@ button.dsm-chip:hover:not(:disabled){color:var(--dsw-alias-label-primary);border
           )
           : null,
         hasTranscript
-          ? h(TranscriptSection, { transcript: meeting.transcript })
+          ? h(SpeakerChips, {
+            meetingId: meeting.id,
+            speakers: meeting.speakers,
+          })
+          : null,
+        hasTranscript
+          ? h(TranscriptSection, {
+            transcript: meeting.transcript,
+            meetingId: meeting.id,
+            edits: meeting.transcriptEdits,
+          })
           : null,
         attendees.length === 0
           ? null
@@ -4038,7 +4612,7 @@ button.dsm-chip:hover:not(:disabled){color:var(--dsw-alias-label-primary);border
             h('div', { className: 'dsm-entry-icon' }, h(Icon, { name: 'mic', size: 17 })),
             h('div', { className: 'dsm-entry-title' }, '录音转文字'),
             h('div', { className: 'dsm-entry-text' }, speechAvailable
-              ? '边说边出字，约 6–10 秒延迟，可后台录音'
+              ? '边说边出字，停顿约 1.5 秒即切（可调 3/5 秒），可后台录音'
               : '语音识别服务未就绪，可先在顶部预加载，或改用文本导入'),
           ),
           h(
@@ -4194,6 +4768,38 @@ button.dsm-chip:hover:not(:disabled){color:var(--dsw-alias-label-primary);border
 
     // ─────────────────────────────── overlay ──────────────────────────────
 
+    /**
+     * Pause-length picker on the live bar. The stored value is read when a
+     * recording starts, so changing it mid-take only affects the next take.
+     */
+    function VadSilenceSelect() {
+      const [value, setValue] = useState(readVadSilenceSeconds)
+      const change = (event) => {
+        const seconds = writeVadSilenceSeconds(event.target.value)
+        setValue(seconds)
+        notify('info', '停顿切片已更新', `停顿 ${seconds} 秒后转写；下次开始录音生效`)
+      }
+      return h(
+        'label',
+        { className: 'dsm-livebar-select', title: '静音停顿多久后把这一句切出来转写（下次开始录音生效）' },
+        h('span', null, '停顿'),
+        h(
+          'select',
+          {
+            value: String(value),
+            onChange: change,
+            'aria-label': '停顿多久后转写',
+          },
+          ...LIVE_VAD_SILENCE_OPTIONS.map((option) => h(
+            'option',
+            { key: option, value: String(option) },
+            `${option} 秒`,
+          )),
+        ),
+        h('span', null, '后转写'),
+      )
+    }
+
     /** Persistent floating bar: the recording survives panel/modal unmounts. */
     function LiveRecordingBar() {
       const state = useSnapshot()
@@ -4231,6 +4837,7 @@ button.dsm-chip:hover:not(:disabled){color:var(--dsw-alias-label-primary);border
         h(
           'div',
           { className: 'dsm-livebar-actions' },
+          !preparing && !stopping ? h(VadSilenceSelect, { key: 'vad' }) : null,
           !preparing && !stopping
             ? h('button', {
               type: 'button',
@@ -4247,15 +4854,306 @@ button.dsm-chip:hover:not(:disabled){color:var(--dsw-alias-label-primary);border
       )
     }
 
+    /**
+     * Bar for a recording started outside this page (agent / CLI through the
+     * JSON API). The panel owns its own capture, so this bar only renders when
+     * there is no local live session but the host reports an active one.
+     */
+    function AgentRecordingBar() {
+      const state = useSnapshot()
+      const local = state.live
+      if (local && liveIsActive(local)) return null
+      const entries = Array.isArray(state.data?.activeRecording) ? state.data.activeRecording : []
+      if (entries.length === 0) return null
+      const entry = entries[0]
+      const started = Date.parse(entry.startedAt)
+      const elapsed = Number.isFinite(started) ? Math.max(0, Math.round((Date.now() - started) / 1000)) : 0
+      const stopping = Array.isArray(state.data?.stopRequested) && state.data.stopRequested.includes(entry.meetingId)
+      // The recorder polls `/state`; this only asks it to finish gracefully.
+      const askStop = async () => {
+        try {
+          await requestJson(`/meetings/${encodeURIComponent(entry.meetingId)}/audio/stop`, { method: 'POST' })
+          const requested = Array.isArray(snapshot.data?.stopRequested) ? snapshot.data.stopRequested : []
+          commit({ data: { ...(snapshot.data ?? {}), stopRequested: [...new Set([...requested, entry.meetingId])] } })
+          notify('info', '正在停止录音', '录音端会把最后几段发完再合并整场，请稍候')
+        } catch (error) {
+          reportError(error, '停止录音失败')
+        }
+      }
+      return h(
+        'div',
+        { className: 'dsm-livebar', role: 'status', 'aria-live': 'polite' },
+        h('span', { className: 'dsm-livebar-dot' }),
+        h(
+          'div',
+          { className: 'dsm-livebar-main' },
+          h(
+            'div',
+            { className: 'dsm-livebar-title' },
+            h('span', null, '正在录音'),
+            h('span', { className: 'dsm-livebar-timer' }, formatTimer(elapsed)),
+            entry.title !== '' ? h('span', { className: 'dsm-hint', style: { fontWeight: 400 } }, entry.title) : null,
+          ),
+          h('div', { className: 'dsm-livebar-meta' }, `由 agent 启动 · 已收 ${entry.slices} 段音频`),
+        ),
+        h(
+          'div',
+          { className: 'dsm-livebar-actions' },
+          h('button', {
+            type: 'button',
+            className: 'dsm-btn dsm-btn--sm',
+            onClick: () => { void askStop() },
+            disabled: stopping,
+            title: '让录音端停止并合并整场音频',
+          }, h('span', null, stopping ? '停止中…' : '停止录音')),
+          h('button', {
+            type: 'button',
+            className: 'dsm-btn dsm-btn--sm',
+            onClick: openMeetingPanel,
+          }, h(Icon, { name: 'doc', size: 11 }), h('span', null, '打开纪要')),
+        ),
+      )
+    }
+
+    // ──────────────────── floating bar drag (remembered) ─────────────────
+    // The live/ended bars are fixed at the bottom centre; a user who moves them
+    // once expects them to stay there, so the spot is remembered per browser.
+
+    const LIVEBAR_POS_KEY = 'dsh.meeting.livebar.position'
+
+    function readLivebarPosition() {
+      try {
+        const raw = window.localStorage.getItem(LIVEBAR_POS_KEY)
+        if (raw === null) return null
+        const parsed = JSON.parse(raw)
+        if (!Number.isFinite(parsed?.left) || !Number.isFinite(parsed?.top)) return null
+        return { left: parsed.left, top: parsed.top }
+      } catch {
+        return null
+      }
+    }
+
+    function saveLivebarPosition(position) {
+      try {
+        window.localStorage.setItem(LIVEBAR_POS_KEY, JSON.stringify(position))
+      } catch {
+        // private mode / storage disabled: dragging still works, just not remembered
+      }
+    }
+
+    function clearLivebarPosition() {
+      try {
+        window.localStorage.removeItem(LIVEBAR_POS_KEY)
+      } catch {
+        // ignore
+      }
+    }
+
+    /** Place one bar at `position`, clamped into the viewport. */
+    function applyLivebarPosition(bar, position) {
+      if (!bar || !position) return
+      const width = bar.offsetWidth || 320
+      const height = bar.offsetHeight || 56
+      const left = Math.min(Math.max(8, position.left), Math.max(8, window.innerWidth - width - 8))
+      const top = Math.min(Math.max(8, position.top), Math.max(8, window.innerHeight - height - 8))
+      bar.style.left = `${Math.round(left)}px`
+      bar.style.top = `${Math.round(top)}px`
+      bar.style.bottom = 'auto'
+      bar.style.transform = 'none'
+    }
+
+    /** Put every mounted live bar on the remembered position. */
+    function placeLivebars() {
+      const position = readLivebarPosition()
+      if (position === null) return
+      for (const bar of document.querySelectorAll('.dsm-livebar')) applyLivebarPosition(bar, position)
+    }
+
+    /** Reset a bar to the default bottom-centre spot (double click). */
+    function resetLivebar(bar) {
+      clearLivebarPosition()
+      if (!bar) return
+      bar.style.left = ''
+      bar.style.top = ''
+      bar.style.bottom = ''
+      bar.style.transform = ''
+    }
+
+    /** Pointer-drag any `.dsm-livebar`; ignores drags that start on a control. */
+    function installLivebarDrag() {
+      let drag = null
+      const onPointerDown = (event) => {
+        if (event.pointerType === 'mouse' && event.button !== 0) return
+        const target = event.target instanceof Element ? event.target : null
+        const bar = target === null ? null : target.closest('.dsm-livebar')
+        if (!bar) return
+        if (target.closest('button, a, input, textarea, select')) return
+        const rect = bar.getBoundingClientRect()
+        drag = { bar, pointerId: event.pointerId, offsetX: event.clientX - rect.left, offsetY: event.clientY - rect.top }
+        bar.dataset.dsmDragging = '1'
+        try {
+          bar.setPointerCapture(event.pointerId)
+        } catch {
+          // pointer capture is best effort (older browsers)
+        }
+      }
+      const onPointerMove = (event) => {
+        if (drag === null || event.pointerId !== drag.pointerId) return
+        applyLivebarPosition(drag.bar, { left: event.clientX - drag.offsetX, top: event.clientY - drag.offsetY })
+        event.preventDefault()
+      }
+      const finish = () => {
+        if (drag === null) return
+        const bar = drag.bar
+        delete bar.dataset.dsmDragging
+        saveLivebarPosition({ left: parseFloat(bar.style.left) || 0, top: parseFloat(bar.style.top) || 0 })
+        drag = null
+      }
+      const onDoubleClick = (event) => {
+        const target = event.target instanceof Element ? event.target : null
+        const bar = target === null ? null : target.closest('.dsm-livebar')
+        if (bar) resetLivebar(bar)
+      }
+      document.addEventListener('pointerdown', onPointerDown)
+      document.addEventListener('pointermove', onPointerMove, { passive: false })
+      document.addEventListener('pointerup', finish)
+      document.addEventListener('pointercancel', finish)
+      document.addEventListener('dblclick', onDoubleClick)
+      // Bars mount and unmount with the recording state; adopt new ones.
+      const observer = typeof MutationObserver === 'function' ? new MutationObserver(() => placeLivebars()) : null
+      if (observer !== null) observer.observe(document.body, { childList: true, subtree: true })
+      placeLivebars()
+      return () => {
+        document.removeEventListener('pointerdown', onPointerDown)
+        document.removeEventListener('pointermove', onPointerMove)
+        document.removeEventListener('pointerup', finish)
+        document.removeEventListener('pointercancel', finish)
+        document.removeEventListener('dblclick', onDoubleClick)
+        if (observer !== null) observer.disconnect()
+      }
+    }
+
+    /**
+     * Short confirmation shown when an agent-started recording disappears from
+     * `/state.activeRecording`: without it the floating bar just vanishes and the
+     * stop looks like a crash. Auto-hides after RECORDING_ENDED_TTL_MS.
+     */
+    function RecordingEndedBar() {
+      const state = useSnapshot()
+      const ended = state.recordingEnded
+      if (!ended) return null
+      const seconds = Number(ended.seconds) || 0
+      return h(
+        'div',
+        { className: 'dsm-livebar dsm-livebar--done', role: 'status', 'aria-live': 'polite' },
+        h('span', { className: 'dsm-livebar-check' }, '✓'),
+        h(
+          'div',
+          { className: 'dsm-livebar-main' },
+          h(
+            'div',
+            { className: 'dsm-livebar-title' },
+            h('span', null, '录音已结束'),
+            h('span', { className: 'dsm-livebar-timer' }, formatTimer(seconds)),
+            ended.title !== '' ? h('span', { className: 'dsm-hint', style: { fontWeight: 400 } }, ended.title) : null,
+          ),
+          h('div', { className: 'dsm-livebar-meta' }, `已保存 ${seconds} 秒整场音频，可打开纪要查看`),
+        ),
+        h(
+          'div',
+          { className: 'dsm-livebar-actions' },
+          h('button', {
+            type: 'button',
+            className: 'dsm-btn dsm-btn--sm',
+            onClick: () => {
+              commit({ recordingEnded: null })
+              void selectMeeting(ended.meetingId)
+              openMeetingPanel()
+            },
+          }, h(Icon, { name: 'doc', size: 11 }), h('span', null, '打开纪要')),
+        ),
+      )
+    }
+
     function ToastOverlay() {
       const state = useSnapshot()
       useEffect(() => {
         ensureStyle()
       }, [])
+      // The floating bars can be dragged anywhere and remember that spot.
+      useEffect(() => installLivebarDrag(), [])
+      // Poll just enough of `/state` to surface an agent-started recording on the
+      // page even when the panel was never opened. Commit only on change.
+      // When the entry disappears the recording just finished: show a short
+      // "已结束" notice instead of letting the bar vanish silently.
+      useEffect(() => {
+        let cancelled = false
+        let previous = null
+        let clearTimer = 0
+        const announceEnded = (entry) => {
+          const started = Date.parse(entry.startedAt)
+          const updated = Date.parse(entry.updatedAt)
+          const seconds = Number.isFinite(started) && Number.isFinite(updated)
+            ? Math.max(0, Math.round((updated - started) / 1000))
+            : 0
+          commit({
+            recordingEnded: {
+              meetingId: entry.meetingId,
+              title: entry.title ?? '',
+              seconds,
+              at: Date.now(),
+            },
+          })
+          // The wall-clock estimate above is only a fallback; the finalized
+          // record carries the real audio duration, so prefer it when it lands.
+          void requestJson(`/meetings/${encodeURIComponent(entry.meetingId)}`).then((payload) => {
+            const saved = Number(payload?.meeting?.audioSeconds) || 0
+            const current = snapshot.recordingEnded
+            if (saved > 0 && current !== null && current.meetingId === entry.meetingId) {
+              commit({ recordingEnded: { ...current, seconds: saved } })
+            }
+          }).catch(() => { /* keep the estimate */ })
+          if (clearTimer !== 0) window.clearTimeout(clearTimer)
+          clearTimer = window.setTimeout(() => {
+            clearTimer = 0
+            commit({ recordingEnded: null })
+          }, RECORDING_ENDED_TTL_MS)
+          // The finalized meeting (with its audio copy) is now in the library.
+          void refreshList()
+        }
+        const tick = async () => {
+          try {
+            const data = await requestJson('/state')
+            if (cancelled) return
+            const next = Array.isArray(data.activeRecording) ? data.activeRecording : []
+            const current = Array.isArray(snapshot.data?.activeRecording) ? snapshot.data.activeRecording : []
+            if (JSON.stringify(next) !== JSON.stringify(current)) {
+              commit({ data: { ...(snapshot.data ?? {}), activeRecording: next } })
+            }
+            if (next.length > 0) {
+              previous = next[0]
+            } else if (previous !== null) {
+              announceEnded(previous)
+              previous = null
+            }
+          } catch {
+            // transient host hiccups are not worth surfacing
+          }
+        }
+        void tick()
+        const timer = setInterval(() => { void tick() }, 3000)
+        return () => {
+          cancelled = true
+          clearInterval(timer)
+          if (clearTimer !== 0) window.clearTimeout(clearTimer)
+        }
+      }, [])
       return h(
         React.Fragment,
         null,
         h(LiveRecordingBar, null),
+        h(AgentRecordingBar, null),
+        h(RecordingEndedBar, null),
         state.toasts.length === 0
           ? null
           : h(
